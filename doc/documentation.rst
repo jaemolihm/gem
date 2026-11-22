@@ -293,10 +293,15 @@ are:
      - Meaning
    * - ``num_eig``
      - ``None``
-     - Number of eigenvalues to compute per sector. ``None`` means the ground
-       state only at :math:`T = 0` and the *full* spectrum at :math:`T > 0`.
-       Required at :math:`T > 0` in matrix-free mode for any sector reaching
-       ``dense_cutoff``.
+     - At :math:`T = 0`, the number of eigenvalues computed per sector
+       (``None``: the ground state only). At :math:`T > 0` its value is not
+       used: set, it selects ``eigsh`` for the sectors reaching
+       ``dense_cutoff``, whose number of eigenpairs grows without cap until
+       the Boltzmann window (``bw_cutoff``) is covered; ``None`` diagonalises
+       every needed sector fully. Required at :math:`T > 0` in matrix-free
+       mode for any sector reaching ``dense_cutoff``; there a sector whose
+       window needs half its dimension or more raises a ``ValueError``
+       (raise ``dense_cutoff`` or ``bw_cutoff``).
    * - ``dense_cutoff``
      - ``4000``
      - Sectors with a dimension below this are diagonalised fully with
