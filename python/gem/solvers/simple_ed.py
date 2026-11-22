@@ -185,6 +185,7 @@ class SimpleED(gemSolver):
         self.Htwo_list      = [None] * self.nloc
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
+        self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
         self.tb_terms       = None  # cached two-body term list, matrix-free only
 
         lookup_max = self.solver_params.get('mf_lookup_max_norb', 22)
@@ -353,10 +354,31 @@ class SimpleED(gemSolver):
         Solve for the ground state, and some excited states if not all, of the embedded Hamiltonian of this fragment.
         For thermal calculation, the global partition function is required.
 
-        :param num_eig: int, optional. Number of eigenvalues to compute. Read
-            from solver_params when not given; if it is None there too, only
-            the ground state is computed at T=0 while at T>0 the full
-            Hamiltonian of each sector is diagonalised.
+        Only the states that enter the partition function are computed, in
+        three phases:
+
+        1. lowest eigenpair ``E0_s`` of every sector ``s`` (``eigsh`` with
+           ``k=1``, or ``eigh`` below ``min(dense_cutoff, 100)``), and
+           ``E_gs = min_s E0_s`` over all ranks;
+        2. sector ``s`` is needed iff ``E0_s - E_gs < W + margin``, with the
+           window ``W = T ln(1/bw_cutoff)`` and ``margin = 2T`` at ``T > 0``
+           (a state is kept iff ``exp(-(E - E_gs)/T) > bw_cutoff``, i.e.
+           ``E - E_gs < W``), and ``W = margin = 1e-4`` at ``T = 0`` (the
+           degeneracy test). The margin covers an ``E0_s`` that ``eigsh``
+           returns too high; a sector not needed keeps no state, as before;
+        3. in a needed sector, the states inside the window: ``eigh`` below
+           ``dense_cutoff`` (and for every sector when ``full_diag``), else
+           ``eigsh`` with ``k`` doubled until the highest eigenvalue found
+           satisfies ``E_k - E_gs >= W`` (``eigh`` once ``k >= dim/2``). At
+           ``T = 0`` it is ``eigsh`` with ``k = num_eig`` as before.
+
+        :param num_eig: int, optional. Read from solver_params when not given.
+            If it is None there too, only the ground state is computed at T=0
+            while at T>0 the needed sectors are diagonalised fully. At T=0 it
+            is the number of ``eigsh`` eigenpairs; at T>0 it only selects the
+            partial (``eigsh``) path, whose ``k`` starts at the number of
+            states kept by the previous solve plus 2 and grows to cover the
+            window.
         :param dense_cutoff: int, optional. Sectors of dimension smaller than
             this are diagonalised fully (eigh), the larger ones partially
             (eigsh). Read from solver_params when not given, default 4000.
@@ -390,42 +412,103 @@ class SimpleED(gemSolver):
         full_diag = (num_eig is None) and (T > 0.0)
         k_eig     = 1 if num_eig is None else num_eig
 
-        # diagonalise the sectors owned by this rank
-        self._t_solve0 = time.perf_counter()
-        self._prof_sec = []
-        self.evals_list = []
-        self.evecs_list = []
+        # a state is kept iff E - E_gs < window; a sector is needed iff
+        # E0_s - E_gs < window + margin
+        if T > 0.0:
+            window, margin = T * np.log(1.0 / bw_cutoff), 2.0 * T
+        else:
+            window, margin = 1e-4, 1e-4
+        dense_p1 = min(dense_cutoff, 100)
 
-        for s, Ham_s in enumerate(self.Ham_list):
-            hsize_s = self.hsize_list[s]
-            if(verbose > 0): print(f'{self._tag()}Sector {self.my_sectors[s]}: '
-                                   f'diagonalising (dim={hsize_s})')
-            t_sec = time.perf_counter()
-            if hsize_s < dense_cutoff:
-                vals, vecs = eigh(Ham_s.to_dense() if self.matrix_free
-                                  else Ham_s.toarray())
-            elif full_diag:
-                if self.matrix_free:
+        if full_diag and self.matrix_free:
+            for s, hsize_s in enumerate(self.hsize_list):
+                if hsize_s >= dense_cutoff:
                     raise ValueError(
                         f"Sector {self.my_sectors[s]} has dimension {hsize_s} "
                         f"(>= dense_cutoff={dense_cutoff}) and T={T} > 0 with "
                         "num_eig unset: the full spectrum cannot be obtained "
                         "matrix-free. Set num_eig large enough to cover the "
                         "thermal window (bw_cutoff), or raise dense_cutoff.")
-                vals, vecs = eigh(Ham_s.toarray())
+
+        def dense_eigh(Ham_s):
+            return eigh(Ham_s.to_dense() if self.matrix_free else Ham_s.toarray())
+
+        self._t_solve0 = time.perf_counter()
+        self._prof_sec = []   # [sector, dim, phase-1 s, phase-3 s, kept, needed, k]
+        self.evals_list = [None] * self.nloc
+        self.evecs_list = [None] * self.nloc
+
+        # 1. Phase 1: E0_s and its vector in every owned sector; the full
+        #    spectrum of the smallest ones, reused in phase 3
+        E0_loc = []
+        for s, Ham_s in enumerate(self.Ham_list):
+            hsize_s = self.hsize_list[s]
+            if(verbose > 0): print(f'{self._tag()}Sector {self.my_sectors[s]}: '
+                                   f'lowest eigenvalue (dim={hsize_s})')
+            t_sec = time.perf_counter()
+            if hsize_s < dense_p1:
+                vals, vecs = dense_eigh(Ham_s)
+                self.evals_list[s], self.evecs_list[s] = vals, vecs
             else:
                 v0 = self.prev_gs_list[s] if T == 0.0 else None
-                vals, vecs = eigsh(Ham_s, k=k_eig, which=which, tol=tol, v0=v0)
+                vals, vecs = eigsh(Ham_s, k=1, which=which, tol=tol, v0=v0)
+            E0_loc.append(float(vals[0]))
+            self.prev_gs_list[s] = vecs[:, 0].copy()
+            self._prof_sec.append([self.my_sectors[s], hsize_s,
+                                   time.perf_counter() - t_sec, 0.0, 0, False, 1])
+        E_gs_p1 = min(e for chunk in self.comm.allgather(E0_loc) for e in chunk)
+
+        # 2. Phase 2: needed iff E0_s - E_gs < window + margin
+        needed = [E0 - E_gs_p1 < window + margin for E0 in E0_loc]
+        self._t_phase1 = time.perf_counter() - self._t_solve0
+
+        # 3. Phase 3: the states inside the window of every needed sector
+        for s, Ham_s in enumerate(self.Ham_list):
+            hsize_s = self.hsize_list[s]
+            t_sec = time.perf_counter()
+            if not needed[s]:
+                # no state of this sector can reach the window
+                self.evals_list[s] = np.empty(0)
+                self.evecs_list[s] = np.empty((hsize_s, 0), dtype=self.data_type)
+                continue
+            if(verbose > 0): print(f'{self._tag()}Sector {self.my_sectors[s]}: '
+                                   f'diagonalising (dim={hsize_s})')
+            k = hsize_s
+            if hsize_s < dense_p1:
+                # full spectrum from phase 1
+                vals, vecs = self.evals_list[s], self.evecs_list[s]
+            elif hsize_s < dense_cutoff:
+                vals, vecs = dense_eigh(Ham_s)
+            elif full_diag:
+                vals, vecs = eigh(Ham_s.toarray())
+            elif T == 0.0:
+                # k_eig states from the phase-1 vector
+                k = k_eig
+                vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
+                                   v0=self.prev_gs_list[s])
+            else:
+                # double k until the highest state found is outside the window
+                k = max(2, self.prev_nkept_list[s] + 2)
+                while True:
+                    if k >= hsize_s // 2:
+                        k = hsize_s
+                        vals, vecs = dense_eigh(Ham_s)
+                        break
+                    vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol)
+                    if vals.max() - E_gs_p1 >= window:
+                        break
+                    k *= 2
             so = vals.argsort()
-            self.evals_list.append(vals[so])
-            self.evecs_list.append(vecs[:, so])
+            self.evals_list[s] = vals[so]
+            self.evecs_list[s] = vecs[:, so]
             self.prev_gs_list[s] = vecs[:, so[0]].copy()
-            self._prof_sec.append([self.my_sectors[s], hsize_s, time.perf_counter() - t_sec, 0])
+            self._prof_sec[s][3:] = [time.perf_counter() - t_sec, 0, True, k]
 
         # global ground-state energy: reduce the per-rank minima. allgather
         # rather than allreduce(MIN) so that every rank also learns which rank
         # holds the ground state (lowest rank wins a tie, so it is unique).
-        local_min   = min((evals[0] for evals in self.evals_list), default=np.inf)
+        local_min   = min((evals[0] for evals in self.evals_list if len(evals) > 0),
+                          default=np.inf)
         rank_min    = self.comm.allgather(float(local_min))
         self.gs_rank = int(np.argmin(rank_min))
         self.gs_ene  = float(rank_min[self.gs_rank])
@@ -446,9 +529,6 @@ class SimpleED(gemSolver):
                         Tloc += 1
                     else:
                         break   # eigenvalues are sorted; remaining are smaller
-                if( (self.hsize_list[s]>dense_cutoff) and (len(bw_s)==k_eig) and (not full_diag) ):
-                    Nsec, Szsec = self.sectors[s]
-                    warnings.warn(f"WARNING: For sector (N,Sz)=({Nsec},{Szsec}) the number of thermal states is equal to the ARPACK cutoff. The last Boltzmann weight is: {bw_s[-1]}")
                 self.bw_per_sector.append(bw_s)
         else:
             if( verbose > 0 ):print(f'{self._tag()}Building GS partition function across sectors')
@@ -472,7 +552,8 @@ class SimpleED(gemSolver):
         # trim per-sector evecs/evals to thermal states only
         for s in range(self.nloc):
             n_s = len(self.bw_per_sector[s])
-            self._prof_sec[s][3] = n_s
+            self._prof_sec[s][4] = n_s
+            self.prev_nkept_list[s] = n_s
             self.evals_list[s] = self.evals_list[s][:n_s]
             self.evecs_list[s] = self.evecs_list[s][:, :n_s]
 
@@ -592,25 +673,28 @@ class SimpleED(gemSolver):
         return dm
 
     def _print_profile(self, t_dm):
-        '''GEM_PROFILE: per-rank build / diagonalisation / density-matrix times and the slowest sectors.'''
-        t_diag = sum(r[2] for r in self._prof_sec)
+        '''GEM_PROFILE: per-rank build / phase-1 / phase-3 / density-matrix times and the slowest sectors.'''
+        t_p1 = sum(r[2] for r in self._prof_sec)
+        t_p3 = sum(r[3] for r in self._prof_sec)
         t_build = self._t_solve0 - self._t_build0
-        rows = self.comm.gather((self.mpi_rank, t_build, t_diag, t_dm, self._prof_sec), root=0)
+        rows = self.comm.gather((self.mpi_rank, t_build, t_p1, t_p3, t_dm, self._t_phase1, self._prof_sec), root=0)
         if self.mpi_rank != 0:
             return
-        tb = np.array([r[1] for r in rows]); td = np.array([r[2] for r in rows]); tm = np.array([r[3] for r in rows])
-        tot = tb + td + tm
-        print(f'[ed-profile] wall(build+diag+dm) {time.perf_counter() - self._t_build0:.2f} s; per rank max/mean: '
-              f'build {tb.max():.2f}/{tb.mean():.2f}, diag {td.max():.2f}/{td.mean():.2f}, '
+        tb, t1, t3, tm, w1 = (np.array([r[i] for r in rows]) for i in (1, 2, 3, 4, 5))
+        tot = tb + t1 + t3 + tm
+        print(f'[ed-profile] wall(build+diag+dm) {time.perf_counter() - self._t_build0:.2f} s, phase 1 incl. allgather '
+              f'{w1.max():.2f} s; per rank max/mean: build {tb.max():.2f}/{tb.mean():.2f}, '
+              f'phase1 {t1.max():.2f}/{t1.mean():.2f}, phase3 {t3.max():.2f}/{t3.mean():.2f}, '
               f'dm {tm.max():.2f}/{tm.mean():.2f}, total {tot.max():.2f}/{tot.mean():.2f} s', flush=True)
-        secs = [x + [r[0]] for r in rows for x in r[4]]
-        dead = [x for x in secs if x[3] == 0]
-        print(f'[ed-profile] sectors {len(secs)}, with no thermal state {len(dead)} '
-              f'(their diag time {sum(x[2] for x in dead):.2f} s cpu of {sum(x[2] for x in secs):.2f})', flush=True)
-        for x in sorted(secs, key=lambda x: -x[2])[:12]:
+        secs = [x + [r[0]] for r in rows for x in r[6]]
+        need = [x for x in secs if x[5]]
+        print(f'[ed-profile] sectors {len(secs)}, needed {len(need)}, with a thermal state '
+              f'{sum(x[4] > 0 for x in secs)}; cpu phase1 {sum(x[2] for x in secs):.2f} s, '
+              f'phase3 {sum(x[3] for x in secs):.2f} s', flush=True)
+        for x in sorted(secs, key=lambda x: -(x[2] + x[3]))[:12]:
             N, Sz = self.sectors[x[0]]
-            print(f'[ed-profile]   sector {x[0]} (N={N}, Sz={Sz}) dim {x[1]} diag {x[2]:.2f} s kept {x[3]} rank {x[4]}',
-                  flush=True)
+            print(f'[ed-profile]   sector {x[0]} (N={N}, Sz={Sz}) dim {x[1]} phase1 {x[2]:.2f} s phase3 {x[3]:.2f} s '
+                  f'needed {x[5]} k {x[6]} kept {x[4]} rank {x[7]}', flush=True)
 
     def compute_E1loc(self, nimp):
         '''
