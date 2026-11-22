@@ -193,6 +193,7 @@ class SimpleED(gemSolver):
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
+        self.prev_evals_list = [None] * self.nloc  # all eigenvalues of the last phase-3 eigsh, place k at a gap
         self._rng           = np.random.default_rng(self.mpi_rank)  # admixture of the phase-1 v0
         self.tb_terms       = None  # cached two-body term list, matrix-free only
 
@@ -402,16 +403,30 @@ class SimpleED(gemSolver):
         3. in a needed sector, the states inside the window. ``eigh`` below
            ``dense_cutoff``, and for every sector when ``num_eig`` is None at
            ``T > 0``. At ``T = 0``, ``eigsh`` with ``k = num_eig`` from the
-           phase-1 vector. At ``T > 0``, ``eigsh`` from a random start with
-           ``k`` = (states kept by the last solve) + 1, at least 2, doubled
-           until the highest eigenvalue found satisfies ``E_k - E_gs >= W``;
-           at ``k >= dim/2`` the sector is diagonalised by ``eigh`` (a
-           ``ValueError`` in matrix-free mode). Each ``eigsh`` runs first with
-           ARPACK's default ``ncv`` and at most 30 restarts. A ``k`` that cuts
-           a cluster of near-degenerate states (splittings ~ tol ``|E|``) does
-           not converge within that cap, or returns rank-deficient vectors
-           ``V`` (``Q R = V`` with ``min |R_ii| < sqrt(eps) max |R_ii|``);
-           either way ``k`` grows by 8 and ``eigsh`` runs from then on with
+           phase-1 vector. At ``T > 0``, ``eigsh`` from a random start,
+           with ``k`` doubled until the highest eigenvalue found satisfies
+           ``E_k - E_gs >= W``; at ``k >= dim/2`` the sector is diagonalised
+           by ``eigh`` (a ``ValueError`` in matrix-free mode). The first
+           ``k``, with ``k_0`` = (states kept by the last solve) + 1, at
+           least 2, and ``E_1 .. E_K`` the eigenvalues of the sector's last
+           ``eigsh``:
+
+           - ``K > k_0``: the first cut of that spectrum in a gap, the
+             smallest ``k`` in ``[k_0, K-1]`` with
+             ``E_{k+1} - E_k > 1e-4 |E_gs|``, else ``k = K`` (the last
+             converged cut). The low spectra are multiplets spread over
+             <= 5e-3 and separated by gaps >= 1.6e-2 (hcp Fe,
+             ``|E_gs| ~ 100``); a ``k`` inside a multiplet costs ARPACK
+             2-6x the matrix-vector products of one in a gap, and on such
+             spectra the capped ``eigsh`` fails at any ``k``. ``eigsh`` runs with
+             ``ncv = max(80, 2k+1)`` and no cap;
+           - else ``k = k_0``, first with ARPACK's default ``ncv`` and at
+             most 30 restarts.
+
+           A ``k`` that cuts a cluster of near-degenerate states does not
+           converge within the cap, or returns rank-deficient vectors ``V``
+           (``Q R = V`` with ``min |R_ii| < sqrt(eps) max |R_ii|``); either
+           way ``k`` grows by 8 and ``eigsh`` runs from then on with
            ``ncv = max(80, 2k+1)`` and no cap. The kept states are the
            Rayleigh-Ritz pairs of ``H`` on ``span(V)``:
            ``Q^H H Q = U diag(E) U^H``, vectors ``Q U`` (``eigsh``'s vectors
@@ -539,6 +554,12 @@ class SimpleED(gemSolver):
                 # 3d. T > 0: double k until the highest state found is outside the window
                 k = max(2, self.prev_nkept_list[s] + 1)  # k = 1 would repeat phase 1
                 capped = True   # default ncv, at most 30 restarts, until one fails
+                E_prev = self.prev_evals_list[s]
+                if E_prev is not None and len(E_prev) > k:
+                    # 3d-i. first cut of the last spectrum E_1..E_K in a gap,
+                    #       E_{k+1} - E_k > 1e-4 |E_gs|, else k = K; uncapped
+                    cut = np.flatnonzero(np.diff(E_prev)[k - 1:] > 1e-4 * abs(E_gs_p1))
+                    k, capped = (k + int(cut[0]) if len(cut) else len(E_prev)), False
                 while True:
                     if k >= hsize_s // 2:
                         if self.matrix_free:
@@ -578,6 +599,7 @@ class SimpleED(gemSolver):
                     # Rayleigh-Ritz on their span, Q = qr(V), Q^H H Q = U diag(E) U^H
                     vals, U = eigh(Q.conj().T @ (Ham_s @ Q))
                     vecs = Q @ U
+                self.prev_evals_list[s] = vals
             so = vals.argsort()
             self.evals_list[s] = vals[so]
             self.evecs_list[s] = vecs[:, so]
