@@ -8,7 +8,7 @@ import os
 import time
 import warnings
 from scipy.sparse import csc_matrix, csr_matrix
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, ArpackNoConvergence
 from scipy.linalg import eigh
 import numpy as np
 from numba import jit
@@ -187,6 +187,7 @@ class SimpleED(gemSolver):
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
+        self._rng           = np.random.default_rng(self.mpi_rank)  # admixture of the phase-1 v0
         self.tb_terms       = None  # cached two-body term list, matrix-free only
 
         lookup_max = self.solver_params.get('mf_lookup_max_norb', 22)
@@ -377,7 +378,11 @@ class SimpleED(gemSolver):
 
         1. lowest eigenpair ``E0_s`` of every sector ``s`` (``eigsh`` with
            ``k=1``, or ``eigh`` below ``min(dense_cutoff, 100)``), and
-           ``E_gs = min_s E0_s`` over all ranks;
+           ``E_gs = min_s E0_s`` over all ranks. At ``T > 0`` ``eigsh`` starts
+           from ``v0 = v_prev + 0.01 r`` (``v_prev`` the sector's lowest
+           vector of the last solve, ``r`` random, both normalised): the
+           random part keeps every symmetry subspace in the Krylov space,
+           which ``v_prev`` alone may miss;
         2. sector ``s`` is needed iff ``E0_s - E_gs < W + margin``, with the
            window ``W = T ln(1/bw_cutoff)`` and ``margin = 2T`` at ``T > 0``
            (a state is kept iff ``exp(-(E - E_gs)/T) > bw_cutoff``, i.e.
@@ -389,13 +394,19 @@ class SimpleED(gemSolver):
            ``eigsh`` with ``k`` doubled until the highest eigenvalue found
            satisfies ``E_k - E_gs >= W`` (``eigh`` once ``k >= dim/2``). At
            ``T = 0`` it is ``eigsh`` with ``k = num_eig`` as before.
+           At ``T > 0``, ``k`` starts at (states kept last solve) + 1, with
+           ARPACK's default ``ncv`` and at most 30 restarts. A ``k`` that cuts
+           a cluster of near-degenerate states (splittings ~ tol |E|, as in
+           the hcp Fe embedding) does not converge in that cap; ``k`` then
+           grows by 8 with ``ncv = max(80, 2k+1)`` and no cap, which converges
+           the clusters in ~10x fewer matvecs than the default ``ncv``.
 
         :param num_eig: int, optional. Read from solver_params when not given.
             If it is None there too, only the ground state is computed at T=0
             while at T>0 the needed sectors are diagonalised fully. At T=0 it
             is the number of ``eigsh`` eigenpairs; at T>0 it only selects the
             partial (``eigsh``) path, whose ``k`` starts at the number of
-            states kept by the previous solve plus 2 and grows to cover the
+            states kept by the previous solve plus 1 and grows to cover the
             window.
         :param dense_cutoff: int, optional. Sectors of dimension smaller than
             this are diagonalised fully (eigh), the larger ones partially
@@ -468,7 +479,13 @@ class SimpleED(gemSolver):
                 vals, vecs = dense_eigh(Ham_s)
                 self.evals_list[s], self.evecs_list[s] = vals, vecs
             else:
-                v0 = self.prev_gs_list[s] if T == 0.0 else None
+                v0 = self.prev_gs_list[s]
+                if T > 0.0 and v0 is not None:
+                    # 1a. v0 = v_prev/|v_prev| + 0.01 r/|r|
+                    r = self._rng.standard_normal(hsize_s)
+                    if np.issubdtype(Ham_s.dtype, np.complexfloating):
+                        r = r + 1j * self._rng.standard_normal(hsize_s)
+                    v0 = v0 / np.linalg.norm(v0) + 0.01 * r / np.linalg.norm(r)
                 vals, vecs = eigsh(Ham_s, k=1, which=which, tol=tol, v0=v0)
             E0_loc.append(float(vals[0]))
             self.prev_gs_list[s] = vecs[:, 0].copy()
@@ -506,13 +523,24 @@ class SimpleED(gemSolver):
                                    v0=self.prev_gs_list[s])
             else:
                 # double k until the highest state found is outside the window
-                k = max(2, self.prev_nkept_list[s] + 2)
+                k = max(2, self.prev_nkept_list[s] + 1)
+                capped = True   # default ncv, at most 30 restarts, until one fails
                 while True:
                     if k >= hsize_s // 2:
                         k = hsize_s
                         vals, vecs = dense_eigh(Ham_s)
                         break
-                    vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol)
+                    try:
+                        if capped:
+                            vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
+                                               maxiter=30)
+                        else:
+                            vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
+                                               ncv=min(hsize_s, max(80, 2 * k + 1)))
+                    except ArpackNoConvergence:
+                        # k cuts a near-degenerate cluster: a larger k and ncv
+                        k, capped = k + 8, False
+                        continue
                     if vals.max() - E_gs_p1 >= window:
                         break
                     k *= 2
