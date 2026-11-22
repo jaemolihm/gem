@@ -1,11 +1,13 @@
 '''
-jacobian_LR and jacobian_LcD (one eigh of H, all parameter directions as one stack) against the per-direction
+jacobian_LR and jacobian_LcD (one eigh of H, parameter directions as dF_spectral stacks) against the per-direction
 reference below (one dF_spectral, i.e. one eigh, per packed parameter), on random complex and real parameters and
 on an SU(2) case X = A (x) 1_2 whose H has exactly degenerate eigenvalue pairs (the f' limit of dF_spectral).
-The degenerate case is also checked against a central finite difference of the residual.
+The degenerate case is also checked against a central finite difference of the residual, and a chunked Jacobian
+(JACOBIAN_CHUNK smaller than the number of parameters) against one chunk.
 '''
 import unittest
 import numpy as np
+from gem import delta_fit
 from gem.delta_fit import (
     pack_params,
     unpack_params,
@@ -131,6 +133,23 @@ class TestJacobianBatched(unittest.TestCase):
             eps = np.linalg.eigvalsh(build_H(d["L"], d["Lc"], d["D"], d["R"]))
             self.assertLess(np.diff(eps).min(), 1e-10)  # the f' limit of dF_spectral is used
             self.check(d)
+
+    def test_chunks(self):
+        # chunks of 7 directions (N = 60: 8 full chunks and a partial one) equal one chunk, bitwise
+        d = inputs(7, 6, 2)
+        x_LR, x_LcD = pack_params(d["L"], d["R"]), pack_params(d["Lc"], d["D"])
+        calls = (lambda: jacobian_LR(x_LR, d["beta"], d["Lc"], d["D"], d["F22"], d["RTF12"]),
+                 lambda: jacobian_LcD(x_LcD, d["beta"], d["L"], d["R"], d["F11"], d["F12D"]))
+        chunk = delta_fit.JACOBIAN_CHUNK
+        try:
+            delta_fit.JACOBIAN_CHUNK = len(x_LR)
+            J_one = [jac() for jac in calls]
+            delta_fit.JACOBIAN_CHUNK = 7
+            J_chunked = [jac() for jac in calls]
+        finally:
+            delta_fit.JACOBIAN_CHUNK = chunk
+        for J0, J in zip(J_one, J_chunked):
+            self.assertTrue(np.array_equal(J0, J))
 
     def test_degenerate_su2_finite_difference(self):
         d = inputs(6, 6, 2, su2=True)

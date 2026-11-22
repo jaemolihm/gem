@@ -8,6 +8,10 @@
 import numpy as np
 from scipy.optimize import root, least_squares, brentq, minimize
 
+# Parameter directions per dF_spectral stack in jacobian_LR / jacobian_LcD: bounds their work arrays to
+# ~6 x 16 JACOBIAN_CHUNK (2n)^2 bytes, whatever the number of parameters.
+JACOBIAN_CHUNK = 256
+
 
 # -------------------------
 # Build H
@@ -46,18 +50,15 @@ def F_of_H(H, beta):
 # -------------------------------------------------
 # Frechet derivative dF(H)[dH]
 # -------------------------------------------------
-def dF_spectral(H, dH, beta, tol=1e-10):
+def fermi_divided_differences(H, beta, tol=1e-10):
     r"""
-    Frechet derivative of F(H) = f(H), f the Fermi function, along dH (Daleckii-Krein formula).
+    Eigendecomposition H = V diag(e) V^dag, the occupations f(e) and the divided differences G of dF_spectral.
 
-    With H = V diag(e) V^dag,
+    Called by dF_spectral, and by jacobian_LR and jacobian_LcD, which pass the result to every dF_spectral call
+    of their direction chunks and build F = V diag(f) V^dag from it, so a Jacobian needs one eigh of H.
 
-        dF(H)[dH] = V (G o (V^dag dH V)) V^dag,
-        G_ij = (f(e_i) - f(e_j)) / (e_i - e_j)    if |e_i - e_j| > tol,
-        G_ij = (f'(e_i) + f'(e_j)) / 2           otherwise (the limit e_j -> e_i),
-
-    with o the elementwise product. dH is one (m, m) matrix or a stack (N, m, m) of directions; the stack shares
-    the single eigh of H. Called by jacobian_LR and jacobian_LcD with the stack of all unit parameter directions.
+    Return:
+        (e, V, f, G), G_ij = (f(e_i) - f(e_j)) / (e_i - e_j) if |e_i - e_j| > tol, else (f'(e_i) + f'(e_j)) / 2.
     """
     # 1. H = V diag(e) V^dag
     eps, U = np.linalg.eigh(H)
@@ -70,6 +71,26 @@ def dF_spectral(H, dH, beta, tol=1e-10):
     G = 0.5*(fp.reshape((1,-1)) + fp.reshape((-1,1)) )
     mask = np.abs(eps_i - eps_j) > tol
     G[mask] = (f[:, None] - f[None, :])[mask] / (eps_i - eps_j)[mask]
+    return eps, U, f, G
+
+def dF_spectral(H, dH, beta, tol=1e-10, spectral=None):
+    r"""
+    Frechet derivative of F(H) = f(H), f the Fermi function, along dH (Daleckii-Krein formula).
+
+    With H = V diag(e) V^dag,
+
+        dF(H)[dH] = V (G o (V^dag dH V)) V^dag,
+        G_ij = (f(e_i) - f(e_j)) / (e_i - e_j)    if |e_i - e_j| > tol,
+        G_ij = (f'(e_i) + f'(e_j)) / 2           otherwise (the limit e_j -> e_i),
+
+    with o the elementwise product. dH is one (m, m) matrix or a stack (N, m, m) of directions; the stack shares
+    one eigh of H. spectral = fermi_divided_differences(H, beta, tol) if given, else computed here: jacobian_LR and
+    jacobian_LcD pass it, so that their chunks of unit parameter directions share one eigh.
+    """
+    # 1-2. H = V diag(e) V^dag and G
+    if spectral is None:
+        spectral = fermi_divided_differences(H, beta, tol)
+    eps, U, f, G = spectral
 
     # 3. dH~ = V^dag dH V
     dH_tilde = U.conj().T @ dH @ U
@@ -226,7 +247,7 @@ def residual_LcD(x, beta, Lambda, R, F11_target, F12D_target):
 # ============================================================
 def jacobian_LR(x, beta, Lambda_c, D, F22_target, RTF12_target):
     r'''
-    Jacobian of residual_LR with respect to the packed (Lambda, R), all columns from one eigh of H.
+    Jacobian of residual_LR with respect to the packed (Lambda, R), F and all columns from one eigh of H.
 
     Called by jacobian_LR_movement (the least-squares fit of update_self_energy_thermal_penalty). With
     F = f(H)^T, H = build_H(Lambda, Lambda_c, D, R), the column of the unit direction (dLambda, dR) is
@@ -235,44 +256,55 @@ def jacobian_LR(x, beta, Lambda_c, D, F22_target, RTF12_target):
         dF = (dF_spectral(H, dH))^T,
         d(F22) = dF[n:, n:],   d(R^T F12) = R^T dF[:n, n:] + dR^T F[:n, n:],
 
-    reduced as in residual_LR (Hermitian F22: Re upper triangle, Im strict upper triangle; R^T F12 full).
+    reduced as in residual_LR (Hermitian F22: Re upper triangle, Im strict upper triangle; R^T F12 full). The
+    directions run in chunks of JACOBIAN_CHUNK, so the work arrays do not grow with the number of parameters.
     '''
     n, p = D.shape
     Lambda, R = unpack_params(x, n, p)
-
-    H = build_H(Lambda, Lambda_c, D, R)
-    F = F_of_H(H, beta).T
-    F12 = F[:n, n:]
-
-    # 1. dH_k = [[dLambda_k, dR_k D^T], [(dR_k D^T)^dag, 0]] for every unit direction k
-    dLambda, dR = unit_perturbations(n, p)
-    N = len(dLambda)
-    dH = np.zeros((N, 2 * n, 2 * n), dtype=complex)
-    dH[:, :n, :n] = dLambda
-    dH12 = dR @ D.T
-    dH[:, :n, n:] = dH12
-    dH[:, n:, :n] = dH12.conj().transpose(0, 2, 1)
-
-    # 2. dF_k = (dF_spectral(H, dH_k))^T, one eigh for all k
-    dF = dF_spectral(H, dH, beta).transpose(0, 2, 1)
-
-    # 3. d(F22)_k = dF_k[n:, n:],  d(R^T F12)_k = R^T dF_k[:n, n:] + dR_k^T F12
-    dF22 = dF[:, n:, n:]
-    dRTF12 = R.T @ dF[:, :n, n:] + dR.transpose(0, 2, 1) @ F12
-
-    # 4. rows in the order of residual_LR, one column per k
     iu = np.triu_indices(n)
     iu_strict = np.triu_indices(n, k=1)
-    return np.concatenate([
-        dF22.real[:, iu[0], iu[1]],
-        dF22.imag[:, iu_strict[0], iu_strict[1]],
-        dRTF12.real.reshape(N, -1),
-        dRTF12.imag.reshape(N, -1)
-    ], axis=1).T
+
+    # 1. H = V diag(e) V^dag, F = (V diag(f) V^dag)^T (= F_of_H(H, beta).T)
+    H = build_H(Lambda, Lambda_c, D, R)
+    spectral = fermi_divided_differences(H, beta)
+    _, U, f, _ = spectral
+    F = ((U * f) @ U.conj().T).T
+    F12 = F[:n, n:]
+
+    dLambda, dR = unit_perturbations(n, p)
+    N = len(dLambda)
+    J_T = np.empty((N, len(iu[0]) + len(iu_strict[0]) + 2 * n * p))
+    # Unit directions k in chunks of JACOBIAN_CHUNK, which bounds the dH and dF stacks
+    for k_start in range(0, N, JACOBIAN_CHUNK):
+        k_range = slice(k_start, min(k_start + JACOBIAN_CHUNK, N))
+        dLambda_chunk, dR_chunk = dLambda[k_range], dR[k_range]
+
+        # 2. dH_k = [[dLambda_k, dR_k D^T], [(dR_k D^T)^dag, 0]]
+        dH = np.zeros((len(dLambda_chunk), 2 * n, 2 * n), dtype=complex)
+        dH[:, :n, :n] = dLambda_chunk
+        dH12 = dR_chunk @ D.T
+        dH[:, :n, n:] = dH12
+        dH[:, n:, :n] = dH12.conj().transpose(0, 2, 1)
+
+        # 3. dF_k = (dF_spectral(H, dH_k))^T
+        dF = dF_spectral(H, dH, beta, spectral=spectral).transpose(0, 2, 1)
+
+        # 4. d(F22)_k = dF_k[n:, n:],  d(R^T F12)_k = R^T dF_k[:n, n:] + dR_k^T F12
+        dF22 = dF[:, n:, n:]
+        dRTF12 = R.T @ dF[:, :n, n:] + dR_chunk.transpose(0, 2, 1) @ F12
+
+        # 5. rows in the order of residual_LR, one column per k
+        J_T[k_range] = np.concatenate([
+            dF22.real[:, iu[0], iu[1]],
+            dF22.imag[:, iu_strict[0], iu_strict[1]],
+            dRTF12.real.reshape(len(dLambda_chunk), -1),
+            dRTF12.imag.reshape(len(dLambda_chunk), -1)
+        ], axis=1)
+    return J_T.T
 
 def jacobian_LcD(x, beta, Lambda, R, F11_target, F12D_target):
     r'''
-    Jacobian of residual_LcD with respect to the packed (Lambda_c, D), all columns from one eigh of H.
+    Jacobian of residual_LcD with respect to the packed (Lambda_c, D), F and all columns from one eigh of H.
 
     Called by jacobian_LcD_movement (the least-squares fit of update_hybridization_thermal_penalty). With
     F = f(H)^T, H = build_H(Lambda, Lambda_c, D, R), the column of the unit direction (dLambda_c, dD) is
@@ -281,40 +313,51 @@ def jacobian_LcD(x, beta, Lambda, R, F11_target, F12D_target):
         dF = (dF_spectral(H, dH))^T,
         d(F11) = dF[:n, :n],   d(F12 D) = dF[:n, n:] D + F[:n, n:] dD,
 
-    reduced as in residual_LcD (Hermitian F11: Re upper triangle, Im strict upper triangle; F12 D full).
+    reduced as in residual_LcD (Hermitian F11: Re upper triangle, Im strict upper triangle; F12 D full). The
+    directions run in chunks of JACOBIAN_CHUNK, so the work arrays do not grow with the number of parameters.
     '''
     n, p = R.shape
     Lambda_c, D = unpack_params(x, n, p)
-
-    H = build_H(Lambda, Lambda_c, D, R)
-    F = F_of_H(H, beta).T
-    F12 = F[:n, n:]
-
-    # 1. dH_k = [[0, R dD_k^T], [(R dD_k^T)^dag, -dLambda_c_k]] for every unit direction k
-    dLambda_c, dD = unit_perturbations(n, p)
-    N = len(dLambda_c)
-    dH = np.zeros((N, 2 * n, 2 * n), dtype=complex)
-    dH[:, n:, n:] = -dLambda_c
-    dH12 = R @ dD.transpose(0, 2, 1)
-    dH[:, :n, n:] = dH12
-    dH[:, n:, :n] = dH12.conj().transpose(0, 2, 1)
-
-    # 2. dF_k = (dF_spectral(H, dH_k))^T, one eigh for all k
-    dF = dF_spectral(H, dH, beta).transpose(0, 2, 1)
-
-    # 3. d(F11)_k = dF_k[:n, :n],  d(F12 D)_k = dF_k[:n, n:] D + F12 dD_k
-    dF11 = dF[:, :n, :n]
-    dF12D = dF[:, :n, n:] @ D + F12 @ dD
-
-    # 4. rows in the order of residual_LcD, one column per k
     iu = np.triu_indices(n)
     iu_strict = np.triu_indices(n, k=1)
-    return np.concatenate([
-        dF11.real[:, iu[0], iu[1]],
-        dF11.imag[:, iu_strict[0], iu_strict[1]],
-        dF12D.real.reshape(N, -1),
-        dF12D.imag.reshape(N, -1)
-    ], axis=1).T
+
+    # 1. H = V diag(e) V^dag, F = (V diag(f) V^dag)^T (= F_of_H(H, beta).T)
+    H = build_H(Lambda, Lambda_c, D, R)
+    spectral = fermi_divided_differences(H, beta)
+    _, U, f, _ = spectral
+    F = ((U * f) @ U.conj().T).T
+    F12 = F[:n, n:]
+
+    dLambda_c, dD = unit_perturbations(n, p)
+    N = len(dLambda_c)
+    J_T = np.empty((N, len(iu[0]) + len(iu_strict[0]) + 2 * n * p))
+    # Unit directions k in chunks of JACOBIAN_CHUNK, which bounds the dH and dF stacks
+    for k_start in range(0, N, JACOBIAN_CHUNK):
+        k_range = slice(k_start, min(k_start + JACOBIAN_CHUNK, N))
+        dLambda_c_chunk, dD_chunk = dLambda_c[k_range], dD[k_range]
+
+        # 2. dH_k = [[0, R dD_k^T], [(R dD_k^T)^dag, -dLambda_c_k]]
+        dH = np.zeros((len(dLambda_c_chunk), 2 * n, 2 * n), dtype=complex)
+        dH[:, n:, n:] = -dLambda_c_chunk
+        dH12 = R @ dD_chunk.transpose(0, 2, 1)
+        dH[:, :n, n:] = dH12
+        dH[:, n:, :n] = dH12.conj().transpose(0, 2, 1)
+
+        # 3. dF_k = (dF_spectral(H, dH_k))^T
+        dF = dF_spectral(H, dH, beta, spectral=spectral).transpose(0, 2, 1)
+
+        # 4. d(F11)_k = dF_k[:n, :n],  d(F12 D)_k = dF_k[:n, n:] D + F12 dD_k
+        dF11 = dF[:, :n, :n]
+        dF12D = dF[:, :n, n:] @ D + F12 @ dD_chunk
+
+        # 5. rows in the order of residual_LcD, one column per k
+        J_T[k_range] = np.concatenate([
+            dF11.real[:, iu[0], iu[1]],
+            dF11.imag[:, iu_strict[0], iu_strict[1]],
+            dF12D.real.reshape(len(dLambda_c_chunk), -1),
+            dF12D.imag.reshape(len(dLambda_c_chunk), -1)
+        ], axis=1)
+    return J_T.T
 
 
 # ---------- Movement-penalized residuals / jacobians for Lambda+R -----------

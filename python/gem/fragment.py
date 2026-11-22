@@ -223,11 +223,15 @@ class Fragment():
         else:
             raise ValueError("Temperature T must be non-negative")
 
-        self.R = np.kron( R_s[0], np.eye(sstep) )
-        self.Lambda = np.kron( L_s[0], np.eye(sstep) )
-        if(sstep==2):
-            self.R[1::2,1::2] = R_s[-1]
-            self.Lambda[1::2,1::2] = L_s[-1]
+        if nfit == 2:  # use_Sz: X = diag(X_up, X_dn) in the interleaved spin order
+            self.R = np.zeros((2 * R_s[0].shape[0], 2 * R_s[0].shape[1]), dtype=np.result_type(*R_s))
+            self.Lambda = np.zeros((2 * L_s[0].shape[0], 2 * L_s[0].shape[1]), dtype=np.result_type(*L_s))
+            for spin in range(2):
+                self.R[spin::2,spin::2] = R_s[spin]
+                self.Lambda[spin::2,spin::2] = L_s[spin]
+        else:  # no spin blocks (sstep 1), or spin_su2: X = X_up (x) 1_2
+            self.R = np.kron( R_s[0], np.eye(sstep) )
+            self.Lambda = np.kron( L_s[0], np.eye(sstep) )
         return self.R, self.Lambda
 
     def update_hybridization(self, T=0.0, move_pen=1e-6, use_Sz=False, tol=1e-9, spin_su2=False):
@@ -268,11 +272,15 @@ class Fragment():
         else:
             raise ValueError("Temperature T must be non-negative")
 
-        self.D = np.kron( D_s[0], np.eye(sstep) )
-        self.Lambda_c = np.kron( Lc_s[0], np.eye(sstep) )
-        if(sstep==2):
-            self.D[1::2,1::2] = D_s[-1]
-            self.Lambda_c[1::2,1::2] = Lc_s[-1]
+        if nfit == 2:  # use_Sz: X = diag(X_up, X_dn) in the interleaved spin order
+            self.D = np.zeros((2 * D_s[0].shape[0], 2 * D_s[0].shape[1]), dtype=np.result_type(*D_s))
+            self.Lambda_c = np.zeros((2 * Lc_s[0].shape[0], 2 * Lc_s[0].shape[1]), dtype=np.result_type(*Lc_s))
+            for spin in range(2):
+                self.D[spin::2,spin::2] = D_s[spin]
+                self.Lambda_c[spin::2,spin::2] = Lc_s[spin]
+        else:  # no spin blocks (sstep 1), or spin_su2: X = X_up (x) 1_2
+            self.D = np.kron( D_s[0], np.eye(sstep) )
+            self.Lambda_c = np.kron( Lc_s[0], np.eye(sstep) )
         return self.D, self.Lambda_c
 
     ###### ROUTINES TO SAVE AND LOAD #####

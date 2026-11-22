@@ -113,13 +113,18 @@ class TestSpinSU2Fit(unittest.TestCase):
         self.compare("update_hybridization", 0.0)
 
     def test_not_su2_raises(self):
-        for method, attr, block in (("update_self_energy", "denMat", (slice(4, 6), slice(4, 6))),
-                                    ("update_self_energy", "R", (slice(0, 2), slice(0, 2))),
-                                    ("update_hybridization", "Delta_qp", (slice(0, 2), slice(0, 2))),
-                                    ("update_hybridization", "ERD", (slice(0, 2), slice(0, 2)))):
+        splitting = np.array([[1, 0], [0, -1]])  # X_uu != X_dd of one orbital
+        spin_flip = np.array([[0, 1], [0, 0]])  # X_ud != 0 of one orbital
+        for method, attr, block, delta in (
+                ("update_self_energy", "denMat", (slice(4, 6), slice(4, 6)), splitting),
+                ("update_self_energy", "R", (slice(0, 2), slice(0, 2)), splitting),
+                ("update_self_energy", "R", (slice(0, 2), slice(0, 2)), spin_flip),
+                ("update_hybridization", "Delta_qp", (slice(0, 2), slice(0, 2)), splitting),
+                ("update_hybridization", "ERD", (slice(0, 2), slice(0, 2)), splitting),
+                ("update_hybridization", "ERD", (slice(0, 2), slice(0, 2)), spin_flip)):
             frag = make_fragment(8, 0.05)
             X = np.array(getattr(frag, attr))
-            X[block] += 1e-8 * np.array([[1, 0], [0, -1]])  # spin splitting of one orbital
+            X[block] += 1e-8 * delta
             setattr(frag, attr, X)
             with self.assertRaises(ValueError):
                 getattr(frag, method)(T=0.05, spin_su2=True)
