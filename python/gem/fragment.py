@@ -357,6 +357,29 @@ class Fragment():
         self.Lambda_c = 0.5*np.kron( self.Lambda_c[::2,::2] + self.Lambda_c[1::2,1::2], np.eye(2) )
         self.D = 0.5*np.kron( self.D[::2,::2] + self.D[1::2,1::2], np.eye(2) )
 
+    def impose_time_reversal_symmetry(self):
+        """
+        Impose time reversal T = i sigma_y K on R, Lambda, D and Lambda_c by replacing each by its real part.
+
+        Called after impose_spin_SU2_symmetry, by a driver that wants a real embedding Hamiltonian (an ED in real
+        arithmetic). With spin SU(2) every matrix is X = A (x) 1_spin and T X T^-1 = A^* (x) 1_spin, so X is
+        time-reversal invariant iff A = A^*, and the TR average (X + T X T^-1)/2 is Re X. This assumes no magnetism,
+        no spin-orbit coupling and real orbitals (real harmonics); in a complex orbital basis Re X is not the TR
+        average. The arrays keep their dtype (complex arrays hold the real values).
+
+        Return:
+            ratio: float. max over R, Lambda, D, Lambda_c of max|Im X| / max|X| before the call (0 for X = 0), the
+            relative size of what was dropped, for the caller's check that the system is TR invariant.
+        """
+        ratio = 0.0
+        for name in ("R", "Lambda", "D", "Lambda_c"):
+            X = np.asarray(getattr(self, name))
+            scale = np.abs(X).max()
+            if scale > 0:
+                ratio = max(ratio, np.abs(X.imag).max() / scale)
+            setattr(self, name, X.real.astype(X.dtype))
+        return ratio
+
     def impose_orbital_symmetry(self):
         """
         Impose orbital symmetry on the self-energy and hybridization parameters by averaging over orbital components.
