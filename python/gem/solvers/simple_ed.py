@@ -544,6 +544,12 @@ class SimpleED(gemSolver):
                     if vals.max() - E_gs_p1 >= window:
                         break
                     k *= 2
+                if k < hsize_s:
+                    # eigsh's vectors of a degenerate cluster are not orthogonal:
+                    # Rayleigh-Ritz on their span, Q = qr(V), Q^H H Q = U diag(E) U^H
+                    Q = np.linalg.qr(vecs)[0]
+                    vals, U = eigh(Q.conj().T @ (Ham_s @ Q))
+                    vecs = Q @ U
             so = vals.argsort()
             self.evals_list[s] = vals[so]
             self.evecs_list[s] = vecs[:, so]

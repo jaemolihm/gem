@@ -18,9 +18,11 @@ import gem.solvers.simple_ed as simple_ed
 from gem.solvers.simple_ed import SimpleED
 
 
-def _random_embedding(norb=10, nimp=4, seed=7, decoupled=False):
+def _random_embedding(norb=10, nimp=4, seed=7, degenerate=False, decoupled=False):
     '''Random spin-diagonal h1e (h_orb x 1_spin, so N and Sz are conserved) and
-    a density-density V2E on the impurity spin-orbitals. With
+    a density-density V2E on the impurity spin-orbitals. With degenerate=True,
+    h_orb commutes with the swap of orbitals 0 and 1, so the spectrum holds
+    exactly degenerate clusters beyond the spin multiplets. With
     decoupled=True the last bath orbital has no hopping and a level 10
     above the others, so its occupation is conserved inside every (N, Sz)
     sector and the lowest state of the wrong occupation lies far outside the
@@ -28,6 +30,9 @@ def _random_embedding(norb=10, nimp=4, seed=7, decoupled=False):
     rng = np.random.default_rng(seed)
     A = rng.normal(size=(norb // 2,) * 2) + 1j * rng.normal(size=(norb // 2,) * 2)
     A = A + A.conj().T
+    if degenerate:
+        P = np.eye(norb // 2)[[1, 0] + list(range(2, norb // 2))]
+        A = 0.5 * (A + P @ A @ P)
     if decoupled:
         A[-1, :-1] = A[:-1, -1] = 0.0
         A[-1, -1] = 25.0
@@ -44,8 +49,9 @@ class TestTwoPhaseSolve(unittest.TestCase):
 
     T, bw_cutoff, norb = 0.3, 1e-6, 10
 
-    def _solve(self, sym=True, decoupled=False, **params):
-        eloc, D, Lambdac, V2E = _random_embedding(self.norb, decoupled=decoupled)
+    def _solve(self, sym=True, degenerate=False, decoupled=False, **params):
+        eloc, D, Lambdac, V2E = _random_embedding(self.norb, degenerate=degenerate,
+                                                  decoupled=decoupled)
         ed = SimpleED(self.norb, use_Ntot=sym, use_Sz=sym,
                       solver_params=dict(use_mpi=False, bw_cutoff=self.bw_cutoff, **params))
         ed.build_Hemb(D, eloc, Lambdac, V2E)
@@ -82,6 +88,21 @@ class TestTwoPhaseSolve(unittest.TestCase):
                 ed.solve_Hemb(T=self.T)
                 np.testing.assert_allclose(ed.calc_density_matrix(), dm_ref, atol=1e-10)
                 self.assertAlmostEqual(ed.Zpart, ref.Zpart, delta=1e-10)
+
+    def test_degenerate_clusters(self):
+        '''Exactly degenerate states in a sector: eigsh returns them with
+        non-orthogonal vectors, the Rayleigh-Ritz step must make the density
+        matrix that of the full diagonalisation.'''
+        ref, dm_ref = self._solve(sym=False, degenerate=True)
+        for matrix_free in (False, True):
+            with self.subTest(matrix_free=matrix_free):
+                ed, dm = self._solve(degenerate=True, num_eig=6, dense_cutoff=40,
+                                     tol=0.0, matrix_free=matrix_free)
+                self._assert_matches_full(ed, dm, ref, dm_ref)
+                # exactly degenerate pairs among the kept states of eigsh sectors
+                kept = [np.diff(e) for e, x in zip(ed.evals_list, ed._prof_sec)
+                        if x[6] < x[1]]
+                self.assertGreater(sum(np.sum(d < 1e-10) for d in kept), 2)
 
     def test_capped_eigsh_fallback(self):
         '''The capped eigsh (maxiter set) is made to fail once per sector, as
