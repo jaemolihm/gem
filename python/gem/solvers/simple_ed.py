@@ -4,6 +4,8 @@
 # Email:  henhans74716@gmail.com, samuele.giuli@gmail.com
 #######################################################
 
+import os
+import time
 import warnings
 from scipy.sparse import csc_matrix
 from scipy.sparse.linalg import eigsh
@@ -267,6 +269,7 @@ class SimpleED(gemSolver):
                     "A spin penalty had been passed. Remember to use this ONLY from T=0 calculations," \
                     "otherwise the boltzmann weights will be wrong at T>0.")
 
+        self._t_build0 = time.perf_counter()
         if(verbose >1): print('build one-body')
         self.build_h1e(eloc, D, Lambdac, mu, verbose=verbose)
 
@@ -388,6 +391,8 @@ class SimpleED(gemSolver):
         k_eig     = 1 if num_eig is None else num_eig
 
         # diagonalise the sectors owned by this rank
+        self._t_solve0 = time.perf_counter()
+        self._prof_sec = []
         self.evals_list = []
         self.evecs_list = []
 
@@ -395,6 +400,7 @@ class SimpleED(gemSolver):
             hsize_s = self.hsize_list[s]
             if(verbose > 0): print(f'{self._tag()}Sector {self.my_sectors[s]}: '
                                    f'diagonalising (dim={hsize_s})')
+            t_sec = time.perf_counter()
             if hsize_s < dense_cutoff:
                 vals, vecs = eigh(Ham_s.to_dense() if self.matrix_free
                                   else Ham_s.toarray())
@@ -414,6 +420,7 @@ class SimpleED(gemSolver):
             self.evals_list.append(vals[so])
             self.evecs_list.append(vecs[:, so])
             self.prev_gs_list[s] = vecs[:, so[0]].copy()
+            self._prof_sec.append([self.my_sectors[s], hsize_s, time.perf_counter() - t_sec, 0])
 
         # global ground-state energy: reduce the per-rank minima. allgather
         # rather than allreduce(MIN) so that every rank also learns which rank
@@ -465,6 +472,7 @@ class SimpleED(gemSolver):
         # trim per-sector evecs/evals to thermal states only
         for s in range(self.nloc):
             n_s = len(self.bw_per_sector[s])
+            self._prof_sec[s][3] = n_s
             self.evals_list[s] = self.evals_list[s][:n_s]
             self.evecs_list[s] = self.evecs_list[s][:, :n_s]
 
@@ -559,6 +567,7 @@ class SimpleED(gemSolver):
         Return:
             array. One-body density-matrix.
         '''
+        t_dm0 = time.perf_counter()
         dm = np.zeros((self.norb, self.norb), dtype=self.data_type)
 
         for s in range(self.nloc):
@@ -574,10 +583,34 @@ class SimpleED(gemSolver):
                     dm[i, j] += self._weighted_trace(
                         self.denmat_op_list[s][(i, j)], U_s, bw_s)
 
+        t_dm = time.perf_counter() - t_dm0
         dm = self.comm.allreduce(dm, op=_MPI_SUM)
         dm /= self.Zpart
         self.dm = dm
+        if os.environ.get('GEM_PROFILE'):
+            self._print_profile(t_dm)
         return dm
+
+    def _print_profile(self, t_dm):
+        '''GEM_PROFILE: per-rank build / diagonalisation / density-matrix times and the slowest sectors.'''
+        t_diag = sum(r[2] for r in self._prof_sec)
+        t_build = self._t_solve0 - self._t_build0
+        rows = self.comm.gather((self.mpi_rank, t_build, t_diag, t_dm, self._prof_sec), root=0)
+        if self.mpi_rank != 0:
+            return
+        tb = np.array([r[1] for r in rows]); td = np.array([r[2] for r in rows]); tm = np.array([r[3] for r in rows])
+        tot = tb + td + tm
+        print(f'[ed-profile] wall(build+diag+dm) {time.perf_counter() - self._t_build0:.2f} s; per rank max/mean: '
+              f'build {tb.max():.2f}/{tb.mean():.2f}, diag {td.max():.2f}/{td.mean():.2f}, '
+              f'dm {tm.max():.2f}/{tm.mean():.2f}, total {tot.max():.2f}/{tot.mean():.2f} s', flush=True)
+        secs = [x + [r[0]] for r in rows for x in r[4]]
+        dead = [x for x in secs if x[3] == 0]
+        print(f'[ed-profile] sectors {len(secs)}, with no thermal state {len(dead)} '
+              f'(their diag time {sum(x[2] for x in dead):.2f} s cpu of {sum(x[2] for x in secs):.2f})', flush=True)
+        for x in sorted(secs, key=lambda x: -x[2])[:12]:
+            N, Sz = self.sectors[x[0]]
+            print(f'[ed-profile]   sector {x[0]} (N={N}, Sz={Sz}) dim {x[1]} diag {x[2]:.2f} s kept {x[3]} rank {x[4]}',
+                  flush=True)
 
     def compute_E1loc(self, nimp):
         '''
