@@ -17,6 +17,7 @@ set(all_tests
   test_two_phase_simple_ed
   test_ham_pattern_simple_ed
   test_time_reversal_fragment
+  test_fragment_spin_su2
   test_delta_fit_LR_B3
   test_delta_fit_LR_random
   test_delta_fit_LcD_B3
