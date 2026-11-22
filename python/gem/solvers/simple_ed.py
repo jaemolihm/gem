@@ -7,7 +7,7 @@
 import os
 import time
 import warnings
-from scipy.sparse import csc_matrix
+from scipy.sparse import csc_matrix, csr_matrix
 from scipy.sparse.linalg import eigsh
 from scipy.linalg import eigh
 import numpy as np
@@ -183,6 +183,7 @@ class SimpleED(gemSolver):
         self.index_list     = []
         self.Hone_list      = [None] * self.nloc
         self.Htwo_list      = [None] * self.nloc
+        self.ham_pattern_list = [None] * self.nloc  # (indptr, indices, P_s, Htwo data) per sector
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
@@ -317,21 +318,38 @@ class SimpleED(gemSolver):
             return
 
         if(verbose > 1): print('one-body + two-body')
+        # h1e flattened as t = i*norb + j, with the |h1e[i,j]| < 1e-8 terms
+        # dropped as in _build_one_body and one_body_terms (matrix-free)
+        h1e_flat = self.h1e.ravel().copy()
+        h1e_flat[np.abs(h1e_flat) < 1e-8] = 0
+        complex_h1e = np.iscomplexobj(h1e_flat)
+        if complex_h1e:
+            # (re, im) columns: P_s stays real and one product gives both parts
+            h1e_flat = h1e_flat.view(np.float64).reshape(-1, 2)
         self.Ham_list = []
         for s in range(self.nloc):
             basis_s     = self.basis_list[s]
             hsize_s     = self.hsize_list[s]
-            denmat_op_s = self.denmat_op_list[s]
-
-            Hone_s = self._build_one_body(self.h1e, hsize_s, denmat_op_s)
-            self.Hone_list[s] = Hone_s
 
             if rebuild_two:
                 self.Htwo_list[s] = self._build_two_body(V2E, basis_s, hsize_s)
+                self.ham_pattern_list[s] = self._build_ham_pattern(
+                    self.denmat_op_list[s], self.Htwo_list[s], hsize_s)
+            indptr, indices, P_s, htwo_data = self.ham_pattern_list[s]
+
+            # 1. Hone_s.data = P_s @ h1e_flat on the fixed pattern of H_s
+            hone_data = P_s @ h1e_flat
+            if complex_h1e:
+                hone_data = np.ascontiguousarray(hone_data).view(np.complex128).ravel()
+            hone_data = hone_data.astype(self.data_type, copy=False)
+            self.Hone_list[s] = csc_matrix((hone_data, indices, indptr),
+                                           shape=(hsize_s, hsize_s))
+            # 2. H_s = Hone_s + Htwo_s, both on that pattern
+            Ham_s = csc_matrix((hone_data + htwo_data, indices, indptr),
+                               shape=(hsize_s, hsize_s))
 
             # add only the penalties switched on: a zero coefficient would
             # still drag its operator's dtype into Ham (Sy is complex)
-            Ham_s = Hone_s + self.Htwo_list[s]
             if spin_pen: Ham_s = Ham_s + spin_pen * self.S2_list[s]
             for pen, op in ((sz_pen, self.Sz_list[s]), (sx_pen, self.Sx_list[s]),
                             (sy_pen, self.Sy_list[s])):
@@ -941,6 +959,51 @@ class SimpleED(gemSolver):
                     continue
                 Hone += H1E[i, j] * denmat_op[(i, j)]
         return Hone
+
+    def _build_ham_pattern(self, denmat_op, Htwo, hsize):
+        '''Fixed sparse pattern of one sector's H and the map from h1e to its one-body data.
+
+        Called by ``build_Hemb`` for each sector whenever ``Htwo`` is rebuilt
+        (first build, new ``V2E`` or dtype). Every later build then forms the
+        one-body part as one sparse product ``P_s @ h1e.ravel()`` on this
+        pattern, instead of summing up to ``norb**2`` scaled ``c^dag_i c_j``
+        matrices (each sum allocating a new sparse matrix).
+
+        The pattern is the union of the patterns of all ``c^dag_i c_j`` and of
+        ``Htwo``, in canonical CSC order; it may hold explicit zeros (a
+        coefficient that vanishes, a cancellation). ``P_s`` is CSR, shape
+        ``(nnz, norb**2)``, ``P_s[p, i*norb + j]`` = the sign of
+        ``c^dag_i c_j`` at pattern entry ``p``: it has one entry per nonzero of
+        ``denmat_op``, so it is smaller than ``denmat_op`` (real data).
+
+        :return: ``(indptr, indices, P_s, htwo_data)``, ``htwo_data`` being
+            ``Htwo``'s data on the pattern.
+        '''
+        norb = self.norb
+        # 1. (row, col, sign, t = i*norb + j) of every c^dag_i c_j entry
+        rows, cols, signs, terms = [], [], [], []
+        for i in range(norb):
+            for j in range(norb):
+                op = denmat_op[(i, j)].tocoo()
+                rows.append(op.row); cols.append(op.col)
+                signs.append(op.data.real)
+                terms.append(np.full(op.nnz, i*norb + j, dtype=np.int64))
+        Htwo = Htwo.tocoo()
+        rows.append(Htwo.row); cols.append(Htwo.col)
+        # 2. pattern = unique keys col*hsize + row (CSC order) over all entries
+        keys = (np.concatenate(cols).astype(np.int64) * hsize
+                + np.concatenate(rows).astype(np.int64))
+        pattern, pos = np.unique(keys, return_inverse=True)
+        indices = (pattern % hsize).astype(np.int32)
+        indptr = np.zeros(hsize + 1, dtype=np.int32)
+        np.cumsum(np.bincount(pattern // hsize, minlength=hsize), out=indptr[1:])
+        # 3. P_s[pos, t] = sign, and Htwo's data scattered onto the pattern
+        n_one = len(keys) - Htwo.nnz
+        P_s = csr_matrix((np.concatenate(signs), (pos[:n_one], np.concatenate(terms))),
+                         shape=(len(pattern), norb*norb))
+        htwo_data = np.zeros(len(pattern), dtype=Htwo.dtype)
+        np.add.at(htwo_data, pos[n_one:], Htwo.data)
+        return indptr, indices, P_s, htwo_data
 
     def _build_two_body(self, Umatrix, basis, hsize):
         '''
