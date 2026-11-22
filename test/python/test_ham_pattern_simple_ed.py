@@ -44,6 +44,8 @@ class TestHamPattern(unittest.TestCase):
         self.assertGreater(len(big), 5)
         for s in big:
             self.assertEqual(ed.Ham_list[s].dtype, ed.data_type)
+            # Htwo is stored on the pattern of H, sharing its index arrays
+            self.assertTrue(np.shares_memory(ed.Htwo_list[s].indices, ed.Ham_list[s].indices))
             diff = abs(ed.Ham_list[s] - self._direct_ham(ed, s, V2E)).max()
             self.assertLess(diff, 1e-13)
 
@@ -76,6 +78,20 @@ class TestHamPattern(unittest.TestCase):
             ref = (self._direct_ham(ed, s, V2E) + 0.7 * ed.S2_list[s]
                    + 0.3 * Sz.dot(Sz))
             self.assertLess(abs(ed.Ham_list[s] - ref).max(), 1e-13)
+
+    def test_build_two_body_invalidates_pattern(self):
+        '''The public build_two_body replaces Htwo by one off the pattern; the
+        next build_Hemb must rebuild Htwo and the pattern, even for the V2E
+        it cached.'''
+        rng = np.random.default_rng(11)
+        ed = SimpleED(self.norb, solver_params=dict(use_mpi=False))   # one sector
+        eloc, D, Lambdac, V2E = _random_embedding(self.norb, self.nimp, rng)
+        ed.build_Hemb(D, eloc, Lambdac, V2E)
+        ed.build_two_body(2.0 * V2E)
+        self.assertIsNone(ed.ham_pattern_list[0])
+        ed.build_Hemb(D, eloc, Lambdac, V2E)
+        self.assertLess(abs(ed.Ham - self._direct_ham(ed, 0, V2E)).max(), 1e-13)
+        self.assertLess(abs(ed.Hone + ed.Htwo - ed.Ham).max(), 1e-13)
 
 
 if __name__ == '__main__':

@@ -127,6 +127,48 @@ class TestTwoPhaseSolve(unittest.TestCase):
                 self.assertTrue(failed)
                 self._assert_matches_full(ed, dm, ref, dm_ref)
 
+    def test_rank_deficient_eigsh(self):
+        '''The capped eigsh (maxiter set) is made to return a duplicate of its
+        lowest vector in place of the second one (rank-deficient V, as for a
+        near-degenerate cluster cut by k), with the right eigenvalues. The
+        solve must detect it from the QR of V, switch to the uncapped eigsh
+        as on no convergence, and keep the states of the full
+        diagonalisation.'''
+        ref, dm_ref = self._solve(sym=False)
+        spoiled, calls = set(), []
+
+        def eigsh_duplicate(A, k=6, **kw):
+            vals, vecs = eigsh(A, k=k, **kw)
+            calls.append((A.shape[0], k, kw.get('maxiter')))
+            if kw.get('maxiter') is not None:
+                spoiled.add(A.shape[0])
+                vecs = vecs.copy()
+                vecs[:, 1] = vecs[:, 0]
+            return vals, vecs
+
+        for matrix_free in (False, True):
+            with self.subTest(matrix_free=matrix_free):
+                spoiled.clear(); calls.clear()
+                with mock.patch.object(simple_ed, 'eigsh', eigsh_duplicate):
+                    ed, dm = self._solve(num_eig=6, dense_cutoff=40,
+                                         tol=0.0, matrix_free=matrix_free)
+                self.assertTrue(spoiled)
+                # each spoiled sector was solved again with the uncapped eigsh
+                for dim in spoiled:
+                    self.assertIn(None, [c[2] for c in calls if c[0] == dim and c[1] >= 2])
+                self._assert_matches_full(ed, dm, ref, dm_ref)
+
+    def test_matrix_free_window_too_large(self):
+        '''Matrix-free, a window holding half a sector or more raises instead
+        of densifying the sector.'''
+        eloc, D, Lambdac, V2E = _random_embedding(self.norb)
+        ed = SimpleED(self.norb, use_Ntot=True, use_Sz=True,
+                      solver_params=dict(use_mpi=False, bw_cutoff=1e-300, num_eig=6,
+                                         dense_cutoff=40, matrix_free=True))
+        ed.build_Hemb(D, eloc, Lambdac, V2E)
+        with self.assertRaisesRegex(ValueError, 'matrix_free'):
+            ed.solve_Hemb(T=50.0)
+
     def test_warm_start_orthogonal_to_ground_state(self):
         '''Phase 1 at T>0 starts from the last solve's vector plus a random
         admixture. With a decoupled bath orbital, its occupation n_b is

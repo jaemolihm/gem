@@ -32,8 +32,11 @@ from ..mpi import MPI, MPI_SUM as _MPI_SUM, resolve_comm
 # sz_pen   : Coupling of (\hat{S}_z)^2 to unfavor magnetization in Z direction
 # which    : Parameter of scipy.sparse.linalg
 # tol      : Parameter of scipy.sparse.linalg
-# num_eig  : Number of eigenvalues to compute. If absent (or None), the ground
-#            state only at T=0 and the full spectrum at T>0.
+# num_eig  : At T=0, the number of eigsh eigenpairs per sector (ground state
+#            only if absent or None). At T>0 its value is not used: set, it
+#            selects eigsh for the sectors reaching dense_cutoff, with k grown
+#            without cap until the Boltzmann window (bw_cutoff) is covered;
+#            None diagonalises every needed sector fully.
 # dense_cutoff : Sectors smaller than this are diagonalized fully with
 #            scipy.linalg.eigh, the larger ones with scipy.sparse.linalg.eigsh
 #            (default 4000).
@@ -76,8 +79,9 @@ class SimpleED(gemSolver):
     ``Zpart``, ``Tstates``, ``deg``, ``dm``, the energies, ``gs_wf``) are
     identical on every rank.
 
-    ``build_Hemb``, ``solve_Hemb``, ``calc_density_matrix``, ``compute_E1loc``,
-    ``compute_E2loc`` and ``calc_double_occ`` are **collective**: every rank of
+    The constructor, ``build_Hemb``, ``solve_Hemb``, ``calc_density_matrix``,
+    ``compute_E1loc``, ``compute_E2loc`` and ``calc_double_occ`` are
+    **collective**: every rank of
     ``comm`` must call them, in the same order. Calling one of them inside an
     ``if rank == 0:`` block deadlocks. ``h5write_gs`` is the exception, it
     writes from rank 0 and is a no-op elsewhere.
@@ -154,6 +158,9 @@ class SimpleED(gemSolver):
         self.comm     = resolve_comm(comm, self.solver_params.get('use_mpi', True))
         self.mpi_rank = self.comm.Get_rank()
         self.mpi_size = self.comm.Get_size()
+        # GEM_PROFILE as rank 0 sees it, so that the profile gather is on every rank or none
+        self._profile = self.comm.bcast(
+            bool(os.environ.get('GEM_PROFILE')) if self.mpi_rank == 0 else None, root=0)
 
         # determine the list of (N, Sz) sector labels to solve
         self.sectors     = self._get_sectors()
@@ -181,9 +188,8 @@ class SimpleED(gemSolver):
         self.Sx_list        = []
         self.Sy_list        = []
         self.index_list     = []
-        self.Hone_list      = [None] * self.nloc
-        self.Htwo_list      = [None] * self.nloc
-        self.ham_pattern_list = [None] * self.nloc  # (indptr, indices, P_s, Htwo data) per sector
+        self.Htwo_list      = [None] * self.nloc  # CSC on the sector's pattern once build_Hemb ran
+        self.ham_pattern_list = [None] * self.nloc  # (indptr, indices, P_s) per sector
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
@@ -299,7 +305,7 @@ class SimpleED(gemSolver):
                           or self.tb_terms is None
         else:
             rebuild_two = (self.V2E is None) or np.any(V2E != self.V2E) \
-                          or any(H is None for H in self.Htwo_list)
+                          or any(p is None for p in self.ham_pattern_list)
         if rebuild_two:
             if(verbose > 1): print('build two-body')
             self.V2E = V2E.copy()
@@ -327,26 +333,31 @@ class SimpleED(gemSolver):
         if complex_h1e:
             # (re, im) columns: P_s stays real and one product gives both parts
             h1e_flat = h1e_flat.view(np.float64).reshape(-1, 2)
+        single_sector = len(self.sectors) == 1 and self.nloc == 1
         self.Ham_list = []
         for s in range(self.nloc):
             basis_s     = self.basis_list[s]
             hsize_s     = self.hsize_list[s]
 
             if rebuild_two:
-                self.Htwo_list[s] = self._build_two_body(V2E, basis_s, hsize_s)
-                self.ham_pattern_list[s] = self._build_ham_pattern(
-                    self.denmat_op_list[s], self.Htwo_list[s], hsize_s)
-            indptr, indices, P_s, htwo_data = self.ham_pattern_list[s]
+                # Htwo_s is kept as its data on the pattern, sharing indptr/indices with H_s
+                indptr, indices, P_s, htwo_data = self._build_ham_pattern(
+                    self.denmat_op_list[s], self._build_two_body(V2E, basis_s, hsize_s),
+                    hsize_s)
+                self.ham_pattern_list[s] = (indptr, indices, P_s)
+                self.Htwo_list[s] = csc_matrix((htwo_data, indices, indptr),
+                                               shape=(hsize_s, hsize_s))
+            indptr, indices, P_s = self.ham_pattern_list[s]
 
             # 1. Hone_s.data = P_s @ h1e_flat on the fixed pattern of H_s
             hone_data = P_s @ h1e_flat
             if complex_h1e:
                 hone_data = np.ascontiguousarray(hone_data).view(np.complex128).ravel()
             hone_data = hone_data.astype(self.data_type, copy=False)
-            self.Hone_list[s] = csc_matrix((hone_data, indices, indptr),
-                                           shape=(hsize_s, hsize_s))
+            if single_sector:
+                self.Hone = csc_matrix((hone_data, indices, indptr), shape=(hsize_s, hsize_s))
             # 2. H_s = Hone_s + Htwo_s, both on that pattern
-            Ham_s = csc_matrix((hone_data + htwo_data, indices, indptr),
+            Ham_s = csc_matrix((hone_data + self.Htwo_list[s].data, indices, indptr),
                                shape=(hsize_s, hsize_s))
 
             # add only the penalties switched on: a zero coefficient would
@@ -359,8 +370,7 @@ class SimpleED(gemSolver):
 
 
         # single-sector backward compat
-        if len(self.sectors) == 1 and self.nloc == 1:
-            self.Hone = self.Hone_list[0]
+        if single_sector:
             self.Htwo = self.Htwo_list[0]
             self.Ham  = self.Ham_list[0]
 
@@ -378,36 +388,41 @@ class SimpleED(gemSolver):
 
         1. lowest eigenpair ``E0_s`` of every sector ``s`` (``eigsh`` with
            ``k=1``, or ``eigh`` below ``min(dense_cutoff, 100)``), and
-           ``E_gs = min_s E0_s`` over all ranks. At ``T > 0`` ``eigsh`` starts
-           from ``v0 = v_prev + 0.01 r`` (``v_prev`` the sector's lowest
-           vector of the last solve, ``r`` random, both normalised): the
-           random part keeps every symmetry subspace in the Krylov space,
-           which ``v_prev`` alone may miss;
+           ``E_gs = min_s E0_s`` over all ranks. ``eigsh`` starts from
+           ``v0 = v_prev + 0.01 r`` (``v_prev`` the sector's lowest vector of
+           the last solve, ``r`` random, both normalised): the random part
+           keeps every symmetry subspace in the Krylov space, which ``v_prev``
+           alone may miss;
         2. sector ``s`` is needed iff ``E0_s - E_gs < W + margin``, with the
            window ``W = T ln(1/bw_cutoff)`` and ``margin = 2T`` at ``T > 0``
            (a state is kept iff ``exp(-(E - E_gs)/T) > bw_cutoff``, i.e.
            ``E - E_gs < W``), and ``W = margin = 1e-4`` at ``T = 0`` (the
            degeneracy test). The margin covers an ``E0_s`` that ``eigsh``
-           returns too high; a sector not needed keeps no state, as before;
-        3. in a needed sector, the states inside the window: ``eigh`` below
-           ``dense_cutoff`` (and for every sector when ``full_diag``), else
-           ``eigsh`` with ``k`` doubled until the highest eigenvalue found
-           satisfies ``E_k - E_gs >= W`` (``eigh`` once ``k >= dim/2``). At
-           ``T = 0`` it is ``eigsh`` with ``k = num_eig`` as before.
-           At ``T > 0``, ``k`` starts at (states kept last solve) + 1, with
+           returns too high; a sector not needed keeps no state;
+        3. in a needed sector, the states inside the window. ``eigh`` below
+           ``dense_cutoff``, and for every sector when ``num_eig`` is None at
+           ``T > 0``. At ``T = 0``, ``eigsh`` with ``k = num_eig`` from the
+           phase-1 vector. At ``T > 0``, ``eigsh`` from a random start with
+           ``k`` = (states kept by the last solve) + 1, at least 2, doubled
+           until the highest eigenvalue found satisfies ``E_k - E_gs >= W``;
+           at ``k >= dim/2`` the sector is diagonalised by ``eigh`` (a
+           ``ValueError`` in matrix-free mode). Each ``eigsh`` runs first with
            ARPACK's default ``ncv`` and at most 30 restarts. A ``k`` that cuts
-           a cluster of near-degenerate states (splittings ~ tol |E|, as in
-           the hcp Fe embedding) does not converge in that cap; ``k`` then
-           grows by 8 with ``ncv = max(80, 2k+1)`` and no cap, which converges
-           the clusters in ~10x fewer matvecs than the default ``ncv``.
+           a cluster of near-degenerate states (splittings ~ tol ``|E|``) does
+           not converge within that cap, or returns rank-deficient vectors
+           ``V`` (``Q R = V`` with ``min |R_ii| < sqrt(eps) max |R_ii|``);
+           either way ``k`` grows by 8 and ``eigsh`` runs from then on with
+           ``ncv = max(80, 2k+1)`` and no cap. The kept states are the
+           Rayleigh-Ritz pairs of ``H`` on ``span(V)``:
+           ``Q^H H Q = U diag(E) U^H``, vectors ``Q U`` (``eigsh``'s vectors
+           of a degenerate cluster are not orthogonal).
 
         :param num_eig: int, optional. Read from solver_params when not given.
             If it is None there too, only the ground state is computed at T=0
             while at T>0 the needed sectors are diagonalised fully. At T=0 it
-            is the number of ``eigsh`` eigenpairs; at T>0 it only selects the
-            partial (``eigsh``) path, whose ``k`` starts at the number of
-            states kept by the previous solve plus 1 and grows to cover the
-            window.
+            is the number of ``eigsh`` eigenpairs; at T>0 its value is not
+            used, it only selects the ``eigsh`` path, whose ``k`` grows without
+            cap until the window is covered.
         :param dense_cutoff: int, optional. Sectors of dimension smaller than
             this are diagonalised fully (eigh), the larger ones partially
             (eigsh). Read from solver_params when not given, default 4000.
@@ -480,7 +495,7 @@ class SimpleED(gemSolver):
                 self.evals_list[s], self.evecs_list[s] = vals, vecs
             else:
                 v0 = self.prev_gs_list[s]
-                if T > 0.0 and v0 is not None:
+                if v0 is not None:
                     # 1a. v0 = v_prev/|v_prev| + 0.01 r/|r|
                     r = self._rng.standard_normal(hsize_s)
                     if np.issubdtype(Ham_s.dtype, np.complexfloating):
@@ -510,26 +525,34 @@ class SimpleED(gemSolver):
                                    f'diagonalising (dim={hsize_s})')
             k = hsize_s
             if hsize_s < dense_p1:
-                # full spectrum from phase 1
+                # 3a. full spectrum from phase 1
                 vals, vecs = self.evals_list[s], self.evecs_list[s]
-            elif hsize_s < dense_cutoff:
+            elif hsize_s < dense_cutoff or full_diag:
+                # 3b. full spectrum by eigh
                 vals, vecs = dense_eigh(Ham_s)
-            elif full_diag:
-                vals, vecs = eigh(Ham_s.toarray())
             elif T == 0.0:
-                # k_eig states from the phase-1 vector
+                # 3c. T = 0: k_eig states from the phase-1 vector
                 k = k_eig
                 vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
                                    v0=self.prev_gs_list[s])
             else:
-                # double k until the highest state found is outside the window
-                k = max(2, self.prev_nkept_list[s] + 1)
+                # 3d. T > 0: double k until the highest state found is outside the window
+                k = max(2, self.prev_nkept_list[s] + 1)  # k = 1 would repeat phase 1
                 capped = True   # default ncv, at most 30 restarts, until one fails
                 while True:
                     if k >= hsize_s // 2:
+                        if self.matrix_free:
+                            raise ValueError(
+                                f"Sector {self.my_sectors[s]} (dim {hsize_s}) needs "
+                                f"k >= dim/2 = {hsize_s // 2} eigenpairs to cover the "
+                                "Boltzmann window, too many for matrix_free=True. Raise "
+                                "dense_cutoff above the sector dimension (the sector is "
+                                "then densified) or raise bw_cutoff.")
                         k = hsize_s
                         vals, vecs = dense_eigh(Ham_s)
                         break
+                    # no v0: a random start has a component in every symmetry
+                    # subspace, so eigsh returns the lowest k, as the stop test assumes
                     try:
                         if capped:
                             vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
@@ -537,8 +560,14 @@ class SimpleED(gemSolver):
                         else:
                             vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
                                                ncv=min(hsize_s, max(80, 2 * k + 1)))
+                        Q, R = np.linalg.qr(vecs)
+                        R_diag = np.abs(np.diag(R))
+                        full_rank = R_diag.min() >= np.sqrt(np.finfo(np.float64).eps) * R_diag.max()
                     except ArpackNoConvergence:
-                        # k cuts a near-degenerate cluster: a larger k and ncv
+                        full_rank = False
+                    if not full_rank:
+                        # k cuts a near-degenerate cluster (no convergence, or a
+                        # near-duplicate vector): a larger k and ncv
                         k, capped = k + 8, False
                         continue
                     if vals.max() - E_gs_p1 >= window:
@@ -547,7 +576,6 @@ class SimpleED(gemSolver):
                 if k < hsize_s:
                     # eigsh's vectors of a degenerate cluster are not orthogonal:
                     # Rayleigh-Ritz on their span, Q = qr(V), Q^H H Q = U diag(E) U^H
-                    Q = np.linalg.qr(vecs)[0]
                     vals, U = eigh(Q.conj().T @ (Ham_s @ Q))
                     vecs = Q @ U
             so = vals.argsort()
@@ -720,7 +748,7 @@ class SimpleED(gemSolver):
         dm = self.comm.allreduce(dm, op=_MPI_SUM)
         dm /= self.Zpart
         self.dm = dm
-        if os.environ.get('GEM_PROFILE'):
+        if self._profile:
             self._print_profile(t_dm)
         return dm
 
@@ -1007,8 +1035,11 @@ class SimpleED(gemSolver):
         ``Htwo``, in canonical CSC order; it may hold explicit zeros (a
         coefficient that vanishes, a cancellation). ``P_s`` is CSR, shape
         ``(nnz, norb**2)``, ``P_s[p, i*norb + j]`` = the sign of
-        ``c^dag_i c_j`` at pattern entry ``p``: it has one entry per nonzero of
-        ``denmat_op``, so it is smaller than ``denmat_op`` (real data).
+        ``c^dag_i c_j`` at pattern entry ``p``. ``P_s`` is extra memory on top
+        of ``denmat_op``, which is kept (density matrix, ``E1loc``, spin
+        operators): one real entry per nonzero of ``denmat_op``, about a third
+        of ``denmat_op``'s size for complex data. The index arrays are int32
+        while ``nnz`` and ``hsize`` fit, int64 otherwise.
 
         :return: ``(indptr, indices, P_s, htwo_data)``, ``htwo_data`` being
             ``Htwo``'s data on the pattern.
@@ -1028,8 +1059,12 @@ class SimpleED(gemSolver):
         keys = (np.concatenate(cols).astype(np.int64) * hsize
                 + np.concatenate(rows).astype(np.int64))
         pattern, pos = np.unique(keys, return_inverse=True)
-        indices = (pattern % hsize).astype(np.int32)
-        indptr = np.zeros(hsize + 1, dtype=np.int32)
+        # int32 when it holds nnz and hsize: scipy converts int64 index arrays
+        # whose values fit in int32 to an int32 copy at every csc_matrix call
+        idx_dtype = (np.int32 if max(len(pattern), hsize) <= np.iinfo(np.int32).max
+                     else np.int64)
+        indices = (pattern % hsize).astype(idx_dtype)
+        indptr = np.zeros(hsize + 1, dtype=idx_dtype)
         np.cumsum(np.bincount(pattern // hsize, minlength=hsize), out=indptr[1:])
         # 3. P_s[pos, t] = sign, and Htwo's data scattered onto the pattern
         n_one = len(keys) - Htwo.nnz
@@ -1139,12 +1174,12 @@ class SimpleED(gemSolver):
     def build_one_body(self, H1E):
         self._reject_if_matrix_free('build_one_body')
         self.Hone = self._build_one_body(H1E, self.hsize_list[0], self.denmat_op_list[0])
-        self.Hone_list[0] = self.Hone
 
     def build_two_body(self, Umatrix, debug=False):
         self._reject_if_matrix_free('build_two_body')
         self.Htwo = self._build_two_body(Umatrix, self.basis_list[0], self.hsize_list[0])
         self.Htwo_list[0] = self.Htwo
+        self.ham_pattern_list[0] = None  # this Htwo is off the pattern: the next build_Hemb rebuilds both
 
     def h5write_gs(self, filename, group_path, name):
         # gs_wf is replicated on every rank: only rank 0 touches the file

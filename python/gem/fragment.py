@@ -368,8 +368,9 @@ class Fragment():
         average. The arrays keep their dtype (complex arrays hold the real values).
 
         Return:
-            ratio: float. max over R, Lambda, D, Lambda_c of max|Im X| / max|X| before the call (0 for X = 0), the
-            relative size of what was dropped, for the caller's check that the system is TR invariant.
+            ratio: float. The max over the four arrays R, Lambda, D, Lambda_c of max|Im X| / max|X| before the call
+            (0 for X = 0), the relative size of what was dropped, for the caller's check that the system is TR
+            invariant. All four are made real whatever the ratio; the caller decides whether it is acceptable.
         """
         ratio = 0.0
         for name in ("R", "Lambda", "D", "Lambda_c"):

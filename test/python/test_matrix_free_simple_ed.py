@@ -123,12 +123,14 @@ class TestMatrixFreeObservables(unittest.TestCase):
         '''dense_cutoff below the largest sector forces eigsh on the operator.
 
         num_eig must stay under dim-1 for the sectors that reach ARPACK, hence
-        the cutoff of 25 rather than 0.
+        the cutoff of 25 rather than 0. At T = 0.1 the window needs k = 8-32
+        states in the sectors of dimension 25-100, below dim/2; at higher T it
+        holds most of each sector, which matrix-free refuses (ValueError).
         '''
         inputs = _make_hemb_inputs(B=4)
         self._compare(inputs, T=0.0, atol=1e-9,
                       dense_cutoff=25, num_eig=1, tol=0.0)
-        self._compare(inputs, T=0.3, atol=1e-9,
+        self._compare(inputs, T=0.1, atol=1e-9,
                       dense_cutoff=25, num_eig=15, tol=0.0)
 
     def test_no_symmetry(self):
