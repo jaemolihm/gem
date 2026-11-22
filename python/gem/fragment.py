@@ -14,6 +14,29 @@ from .solvers.gem_solver import gemSolver
 import h5py
 
 
+def check_spin_SU2(arrays, tol=1e-10):
+    '''
+    Raise ValueError unless every array is X = A (x) 1_2 in the spin-fast layout (spin up on even, down on odd
+    indices) to tol relative: max(|X_ud|, |X_du|, |X_uu - X_dd|) <= tol max|X|.
+
+    Called by Fragment.update_self_energy and Fragment.update_hybridization with spin_su2=True, on the inputs of
+    the fit (parameters and targets): their fit of the spin-up block A alone gives X = A (x) 1_2 only if all of
+    them have this form.
+
+    :param arrays: dict name -> ndarray of even dimensions.
+    '''
+    for name, X in arrays.items():
+        X = np.asarray(X)
+        scale = np.abs(X).max()
+        if scale == 0:
+            continue
+        asym = max(np.abs(X[0::2, 1::2]).max(), np.abs(X[1::2, 0::2]).max(),
+                   np.abs(X[0::2, 0::2] - X[1::2, 1::2]).max()) / scale
+        if asym > tol:
+            raise ValueError(f"spin_su2=True needs {name} = A (x) 1_spin; its spin asymmetry is {asym:.1e} "
+                             f"relative to max|{name}| (tolerance {tol:.0e})")
+
+
 class Fragment():
     '''
     Class for the embedded correlated space.
@@ -158,13 +181,16 @@ class Fragment():
         self.nfill  = np.trace( self.denMat[:self.nimp,:self.nimp] )
         self.E2loc  = self.solver.compute_E2loc()
 
-    def update_self_energy(self, T=0.0, move_pen=1e-6, use_Sz=False, tol=1e-9):
+    def update_self_energy(self, T=0.0, move_pen=1e-6, use_Sz=False, tol=1e-9, spin_su2=False):
         '''
         This function update the self-energy parameters Lambda and R
 
         :param T: float, optional. Temperature (default: 0.0).
         :param move_pen: float, optional. Penalty for moving the self-energy parameters (default: 1e-6).
         :param use_Sz: bool, optional. Whether to use Sz as a good quantum number (default: False).
+        :param spin_su2: bool, optional. Spin SU(2): Lambda, R, Lambda_c, D and the density matrix blocks
+            <f^dag f>, <c^dag f> are all X = A (x) 1_2 (checked to 1e-10 relative, else ValueError), so only the
+            spin-up block is fitted and X = A (x) 1_2 is returned (default: False).
 
         Return:
             R: ndarray. Updated self-energy parameter R.
@@ -174,18 +200,22 @@ class Fragment():
         fdagf = self.denMat[self.nimp:,self.nimp:]
         self.Delta_aim = np.eye(self.nbath) - fdagf
 
-        sstep = 2 if use_Sz else 1
+        if spin_su2:
+            check_spin_SU2(dict(Lambda=self.Lambda, R=self.R, Lambda_c=self.Lambda_c, D=self.D,
+                                fdagf=fdagf, cdagf=cdagf))
+        sstep = 2 if (use_Sz or spin_su2) else 1
+        nfit = 1 if spin_su2 else sstep  # SU(2): the spin-down block equals the spin-up one
         L_s=[]; R_s=[]
         if T > 0.0:
-            for spin in range(sstep):
+            for spin in range(nfit):
                 L_new, R_new = update_self_energy_thermal_penalty(self.Lambda[spin::sstep,spin::sstep], self.R[spin::sstep,spin::sstep],
                                                                 self.Lambda_c[spin::sstep,spin::sstep], self.D[spin::sstep,spin::sstep],
                                                                 fdagf[spin::sstep,spin::sstep], cdagf[spin::sstep,spin::sstep],
                                                                 beta=1/T, alpha=move_pen, method="dF", tol=tol)
                 L_s.append(L_new); R_s.append(R_new)
         elif T == 0.0:
-            hlist = self.Hs_list if use_Sz else self.H_list
-            for spin in range(sstep):
+            hlist = self.Hs_list if sstep == 2 else self.H_list
+            for spin in range(nfit):
                 R_new = np.transpose( cdagf[spin::sstep,spin::sstep].dot( funcMat(self.Delta_aim[spin::sstep,spin::sstep], denR)) )
                 L_new = calc_Lambda( R_new, self.Lambda_c[spin::sstep,spin::sstep],
                                     self.Delta_aim[spin::sstep,spin::sstep], self.D[spin::sstep,spin::sstep], hlist )
@@ -193,37 +223,48 @@ class Fragment():
         else:
             raise ValueError("Temperature T must be non-negative")
 
-        self.R = np.kron( R_s[0], np.eye(sstep) )
-        self.Lambda = np.kron( L_s[0], np.eye(sstep) )
-        if(sstep==2):
-            self.R[1::2,1::2] = R_s[1]
-            self.Lambda[1::2,1::2] = L_s[1]
+        if nfit == 2:  # use_Sz: X = diag(X_up, X_dn) in the interleaved spin order
+            self.R = np.zeros((2 * R_s[0].shape[0], 2 * R_s[0].shape[1]), dtype=np.result_type(*R_s))
+            self.Lambda = np.zeros((2 * L_s[0].shape[0], 2 * L_s[0].shape[1]), dtype=np.result_type(*L_s))
+            for spin in range(2):
+                self.R[spin::2,spin::2] = R_s[spin]
+                self.Lambda[spin::2,spin::2] = L_s[spin]
+        else:  # no spin blocks (sstep 1), or spin_su2: X = X_up (x) 1_2
+            self.R = np.kron( R_s[0], np.eye(sstep) )
+            self.Lambda = np.kron( L_s[0], np.eye(sstep) )
         return self.R, self.Lambda
 
-    def update_hybridization(self, T=0.0, move_pen=1e-6, use_Sz=False, tol=1e-9):
+    def update_hybridization(self, T=0.0, move_pen=1e-6, use_Sz=False, tol=1e-9, spin_su2=False):
         '''
         This function update the hybridization parameters Lambda_c and D
 
         :param T: float, optional. Temperature (default: 0.0).
         :param move_pen: float, optional. Penalty for moving the hybridization parameters (default: 1e-6).
         :param use_Sz: bool, optional. Whether to use Sz as a good quantum number (default: False).
+        :param spin_su2: bool, optional. Spin SU(2): Lambda_c, D, Lambda, R, Delta_qp and ERD are all
+            X = A (x) 1_2 (checked to 1e-10 relative, else ValueError), so only the spin-up block is fitted and
+            X = A (x) 1_2 is returned (default: False).
 
         Return:
             D: ndarray. Updated hybridization parameter D.
             Lambda_c: ndarray. Updated hybridization parameter Lambda_c.
         '''
-        sstep = 2 if use_Sz else 1
+        if spin_su2:
+            check_spin_SU2(dict(Lambda_c=self.Lambda_c, D=self.D, Lambda=self.Lambda, R=self.R,
+                                Delta_qp=self.Delta_qp, ERD=self.ERD))
+        sstep = 2 if (use_Sz or spin_su2) else 1
+        nfit = 1 if spin_su2 else sstep  # SU(2): the spin-down block equals the spin-up one
         D_s=[]; Lc_s=[]
         if T > 0.0:
-            for spin in range(sstep):
+            for spin in range(nfit):
                 Lc_new, D_new = update_hybridization_thermal_penalty(self.Lambda_c[spin::sstep,spin::sstep], self.D[spin::sstep,spin::sstep],
                                                                      self.Lambda[spin::sstep,spin::sstep], self.R[spin::sstep,spin::sstep],
                                                                      self.Delta_qp[spin::sstep,spin::sstep], self.ERD.T[spin::sstep,spin::sstep],
                                                                      beta=1/T, alpha=move_pen, method="dF", tol=tol)
                 Lc_s.append(Lc_new); D_s.append(D_new)
         elif T == 0.0:
-            hlist = self.Hs_list if use_Sz else self.H_list
-            for spin in range(sstep):
+            hlist = self.Hs_list if sstep == 2 else self.H_list
+            for spin in range(nfit):
                 D_new = np.dot(funcMat(self.Delta_qp[spin::sstep,spin::sstep], denR),np.transpose(self.ERD[spin::sstep,spin::sstep]))
                 Lc_new = calc_Lambda_c(self.R[spin::sstep,spin::sstep], self.Lambda[spin::sstep,spin::sstep],
                                        self.Delta_qp[spin::sstep,spin::sstep], D_new, hlist)
@@ -231,11 +272,15 @@ class Fragment():
         else:
             raise ValueError("Temperature T must be non-negative")
 
-        self.D = np.kron( D_s[0], np.eye(sstep) )
-        self.Lambda_c = np.kron( Lc_s[0], np.eye(sstep) )
-        if(sstep==2):
-            self.D[1::2,1::2] = D_s[1]
-            self.Lambda_c[1::2,1::2] = Lc_s[1]
+        if nfit == 2:  # use_Sz: X = diag(X_up, X_dn) in the interleaved spin order
+            self.D = np.zeros((2 * D_s[0].shape[0], 2 * D_s[0].shape[1]), dtype=np.result_type(*D_s))
+            self.Lambda_c = np.zeros((2 * Lc_s[0].shape[0], 2 * Lc_s[0].shape[1]), dtype=np.result_type(*Lc_s))
+            for spin in range(2):
+                self.D[spin::2,spin::2] = D_s[spin]
+                self.Lambda_c[spin::2,spin::2] = Lc_s[spin]
+        else:  # no spin blocks (sstep 1), or spin_su2: X = X_up (x) 1_2
+            self.D = np.kron( D_s[0], np.eye(sstep) )
+            self.Lambda_c = np.kron( Lc_s[0], np.eye(sstep) )
         return self.D, self.Lambda_c
 
     ###### ROUTINES TO SAVE AND LOAD #####
