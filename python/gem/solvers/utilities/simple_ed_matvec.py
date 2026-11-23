@@ -276,6 +276,25 @@ def build_dense(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
 
 
 @jit(nopython=True)
+def accum_diagonal(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
+                   basis, bit_max, norb, diag):
+    '''``diag[c] += <c|H|c>``: the terms that map the Fock state ``c`` to itself.'''
+    for c in range(basis.size):
+        bsr = basis[c]
+        for t in range(ob_i.size):
+            if ob_i[t] != ob_j[t]:
+                continue
+            bsl, sign = cid_cj_target(ob_i[t], ob_j[t], bsr, bit_max, norb)
+            if sign != 0:
+                diag[c] += ob_v[t] * sign
+        for t in range(tb_i.size):
+            bsl, sign = two_body_target(tb_i[t], tb_j[t], tb_k[t], tb_l[t],
+                                        bsr, bit_max, norb)
+            if sign != 0 and bsl == bsr:
+                diag[c] += tb_v[t] * sign
+
+
+@jit(nopython=True)
 def accum_denmat(basis, index, bit_max, norb, nmax, U, bw, dm):
     '''``dm[i,j] += sum_n bw[n] <n| c^dag_i c_j |n>`` for ``i, j < nmax``.
 
@@ -355,6 +374,13 @@ class EmbeddingHamiltonian(LinearOperator):
         apply_terms(*empty_one_body_terms(self.dtype), *self.tb_terms,
                     self.basis, self.index, self.bit_max, self.norb, x, out)
         return out
+
+    def diagonal(self):
+        '''``diag(H)``, for PRIMME's Jacobi preconditioner.'''
+        d = np.zeros(self.shape[0], dtype=self.dtype)
+        accum_diagonal(*self.ob_terms, *self.tb_terms,
+                       self.basis, self.bit_max, self.norb, d)
+        return d
 
     def to_dense(self):
         '''Dense ``H``, for the sectors small enough to go through eigh.'''
