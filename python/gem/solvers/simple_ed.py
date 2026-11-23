@@ -58,7 +58,9 @@ from ..mpi import MPI, MPI_SUM as _MPI_SUM, resolve_comm
 #            sectors in phase 3 (see solve_Hemb). 'primme' needs the primme
 #            package; without it the ARPACK path runs, with a warning.
 # primme_tol : PRIMME convergence, ||H v - E v|| <= primme_tol |E_gs| per
-#            pair (default 1e-10).
+#            pair (default 1e-12: at 1e-10 the density matrix of an SU(2)
+#            problem is spin-asymmetric by ~1e-10, which Fragment's spin_su2
+#            check rejects; ARPACK at tol 1e-8 over-converges to ~1e-14).
 
 # Smallest gap E_{k+1} - E_k (energy units of H, eV) that separates multiplets at
 # the phase-3 starting k; absolute since E_gs moves with mu and the energy
@@ -512,7 +514,7 @@ class SimpleED(gemSolver):
             window, margin = 1e-4, 1e-4
         dense_p1 = min(dense_cutoff, 100)
         use_primme = self.eigensolver == 'primme' and primme is not None
-        primme_tol = self.solver_params.get('primme_tol', 1e-10)
+        primme_tol = self.solver_params.get('primme_tol', 1e-12)
 
         if full_diag and self.matrix_free:
             for s, hsize_s in enumerate(self.hsize_list):
