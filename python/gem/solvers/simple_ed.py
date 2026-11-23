@@ -51,6 +51,11 @@ from ..mpi import MPI, MPI_SUM as _MPI_SUM, resolve_comm
 #            table of 2^norb entries when norb is at most this (default 22),
 #            otherwise fall back to a binary search per applied term.
 
+# Smallest gap E_{k+1} - E_k (energy units of H, eV) that separates multiplets at
+# the phase-3 starting k; absolute since E_gs moves with mu and the energy
+# reference while the multiplet splittings do not.
+GAP_START_MIN = 1e-2
+
 class SimpleED(gemSolver):
     '''
     Simple exact diagonalization solver for a general embedding Hamiltonian.
@@ -193,7 +198,7 @@ class SimpleED(gemSolver):
         self.V2E            = None  # cached interaction tensor for rebuild check
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
-        self.prev_evals_list = [None] * self.nloc  # all eigenvalues of the last phase-3 eigsh, place k at a gap
+        self.prev_evals_list = [None] * self.nloc  # eigenvalues of the sector's last T > 0 eigsh/eigh (branch 3d); sets the next starting k at a gap
         self._rng           = np.random.default_rng(self.mpi_rank)  # admixture of the phase-1 v0
         self.tb_terms       = None  # cached two-body term list, matrix-free only
 
@@ -413,13 +418,11 @@ class SimpleED(gemSolver):
 
            - ``K > k_0``: the first cut of that spectrum in a gap, the
              smallest ``k`` in ``[k_0, K-1]`` with
-             ``E_{k+1} - E_k > 1e-4 |E_gs|``, else ``k = K`` (the last
-             converged cut). The low spectra are multiplets spread over
-             <= 5e-3 and separated by gaps >= 1.6e-2 (hcp Fe,
-             ``|E_gs| ~ 100``); a ``k`` inside a multiplet costs ARPACK
-             2-6x the matrix-vector products of one in a gap, and on such
-             spectra the capped ``eigsh`` fails at any ``k``. ``eigsh`` runs with
-             ``ncv = max(80, 2k+1)`` and no cap;
+             ``E_{k+1} - E_k > GAP_START_MIN = 1e-2``, else ``k = K``, the
+             final ``k`` of the last solve. A ``k`` inside a multiplet costs
+             ARPACK several times the matvecs of a ``k`` at a gap; a capped
+             ``eigsh`` there does not converge on clustered spectra.
+             ``eigsh`` runs with ``ncv = max(80, 2k+1)`` and no cap;
            - else ``k = k_0``, first with ARPACK's default ``ncv`` and at
              most 30 restarts.
 
@@ -553,13 +556,14 @@ class SimpleED(gemSolver):
             else:
                 # 3d. T > 0: double k until the highest state found is outside the window
                 k = max(2, self.prev_nkept_list[s] + 1)  # k = 1 would repeat phase 1
-                capped = True   # default ncv, at most 30 restarts, until one fails
+                capped = True   # default ncv, at most 30 restarts; uncapped from a gap start or after a failure
                 E_prev = self.prev_evals_list[s]
                 if E_prev is not None and len(E_prev) > k:
-                    # 3d-i. first cut of the last spectrum E_1..E_K in a gap,
-                    #       E_{k+1} - E_k > 1e-4 |E_gs|, else k = K; uncapped
-                    cut = np.flatnonzero(np.diff(E_prev)[k - 1:] > 1e-4 * abs(E_gs_p1))
-                    k, capped = (k + int(cut[0]) if len(cut) else len(E_prev)), False
+                    # first k: the first cut of the last spectrum E_1..E_K in a gap,
+                    # E_{k+1} - E_k > GAP_START_MIN, else k = K
+                    cut = np.flatnonzero(np.diff(E_prev)[k - 1:] > GAP_START_MIN)
+                    k = k + int(cut[0]) if len(cut) else len(E_prev)
+                    capped = False
                 while True:
                     if k >= hsize_s // 2:
                         if self.matrix_free:

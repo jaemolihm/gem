@@ -161,13 +161,13 @@ class TestTwoPhaseSolve(unittest.TestCase):
     def test_start_k_at_gap(self):
         '''The last eigsh spectrum E_1..E_K of a sector sets the next starting
         k: the first cut E_k | E_{k+1} with k >= kept + 1 in a gap
-        (> 1e-4 |E_gs|), else k = K. Give every other eigsh sector a last
-        spectrum with a cluster (splittings 1e-6) on kept + 1 .. kept + 3 and
-        a gap after it, so the cut kept + 1 | kept + 2 lies inside the
-        cluster and k must be kept + 3; the other sectors get the cluster
-        alone (K = kept + 3, no gap), so k must be K. Each first eigsh must
-        run at that k uncapped, and the kept states stay those of the full
-        diagonalisation.'''
+        (E_{k+1} - E_k > GAP_START_MIN = 1e-2), else k = K. Give every other
+        eigsh sector a last spectrum with a cluster (splittings 1e-6) on
+        kept + 1 .. kept + 3 and a gap (1.0) after it, so the cut
+        kept + 1 | kept + 2 lies inside the cluster and k must be kept + 3;
+        the other sectors get the cluster alone (K = kept + 3, no gap), so
+        k must be K. Each first eigsh must run at that k uncapped, and the
+        kept states stay those of the full diagonalisation.'''
         ref, dm_ref = self._solve(sym=False)
         calls = []
 
@@ -196,6 +196,8 @@ class TestTwoPhaseSolve(unittest.TestCase):
                 for a, k, maxiter in calls:
                     if k >= 2:
                         first.setdefault(a, (k, maxiter))
+                for a in expected:
+                    self.assertIn(a, first)
                 self.assertEqual({a: first[a] for a in expected},
                                  {a: (k, None) for a, k in expected.items()})
                 self._assert_matches_full(ed, ed.calc_density_matrix(), ref, dm_ref)
