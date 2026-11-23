@@ -158,6 +158,50 @@ class TestTwoPhaseSolve(unittest.TestCase):
                     self.assertIn(None, [c[2] for c in calls if c[0] == dim and c[1] >= 2])
                 self._assert_matches_full(ed, dm, ref, dm_ref)
 
+    def test_start_k_at_gap(self):
+        '''The last eigsh spectrum E_1..E_K of a sector sets the next starting
+        k: the first cut E_k | E_{k+1} with k >= kept + 1 in a gap
+        (E_{k+1} - E_k > GAP_START_MIN = 1e-2), else k = K. Give every other
+        eigsh sector a last spectrum with a cluster (splittings 1e-6) on
+        kept + 1 .. kept + 3 and a gap (1.0) after it, so the cut
+        kept + 1 | kept + 2 lies inside the cluster and k must be kept + 3;
+        the other sectors get the cluster alone (K = kept + 3, no gap), so
+        k must be K. Each first eigsh must run at that k uncapped, and the
+        kept states stay those of the full diagonalisation.'''
+        ref, dm_ref = self._solve(sym=False)
+        calls = []
+
+        def eigsh_logged(A, k=6, **kw):
+            calls.append((id(A), k, kw.get('maxiter')))
+            return eigsh(A, k=k, **kw)
+
+        for matrix_free in (False, True):
+            with self.subTest(matrix_free=matrix_free):
+                ed, _ = self._solve(num_eig=6, dense_cutoff=40, tol=0.0,
+                                    matrix_free=matrix_free)
+                expected = {}
+                eig_secs = [s for s, x in enumerate(ed._prof_sec) if x[5] and x[6] < x[1]]
+                for i, s in enumerate(eig_secs):
+                    k0 = max(2, ed.prev_nkept_list[s] + 1)
+                    E_low = np.arange(k0 - 1, dtype=float)
+                    cluster = k0 + np.array([0.0, 1e-6, 2e-6])
+                    after = cluster + 1.0 if i % 2 == 0 else []
+                    ed.prev_evals_list[s] = np.concatenate([E_low, cluster, after])
+                    expected[id(ed.Ham_list[s])] = k0 + 2
+                self.assertGreater(len(expected), 3)
+                calls.clear()
+                with mock.patch.object(simple_ed, 'eigsh', eigsh_logged):
+                    ed.solve_Hemb(T=self.T)
+                first = {}
+                for a, k, maxiter in calls:
+                    if k >= 2:
+                        first.setdefault(a, (k, maxiter))
+                for a in expected:
+                    self.assertIn(a, first)
+                self.assertEqual({a: first[a] for a in expected},
+                                 {a: (k, None) for a, k in expected.items()})
+                self._assert_matches_full(ed, ed.calc_density_matrix(), ref, dm_ref)
+
     def test_matrix_free_window_too_large(self):
         '''Matrix-free, a window holding half a sector or more raises instead
         of densifying the sector.'''
