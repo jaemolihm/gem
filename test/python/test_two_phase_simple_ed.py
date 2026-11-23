@@ -11,7 +11,9 @@ above its starting value of 2.
 '''
 import unittest
 from unittest import mock
+import time
 import numpy as np
+from scipy.sparse import identity
 from scipy.sparse.linalg import eigsh, ArpackNoConvergence
 
 import gem.solvers.simple_ed as simple_ed
@@ -251,10 +253,11 @@ class TestTwoPhaseSolve(unittest.TestCase):
 @unittest.skipIf(simple_ed.primme is None, 'primme is not installed')
 class TestTwoPhaseSolvePrimme(TestTwoPhaseSolve):
     '''The cases above with the eigsh sectors of phase 3 solved by PRIMME
-    (eigensolver='primme'), at primme_tol 1e-12 so that the 1e-10 comparisons
-    with the full diagonalisation resolve it; the kept vectors must be
-    orthonormal. The eigsh-specific cases (capped fallback, rank-deficient
-    output, gap start) do not reach eigsh here and are skipped.'''
+    (eigensolver='primme'), at primme_tol 1e-12 (absolute residual) so that
+    the 1e-10 comparisons with the full diagonalisation resolve it; the kept
+    vectors must be orthonormal. The eigsh-specific cases (capped fallback,
+    rank-deficient output, gap start) do not reach eigsh here and are
+    skipped.'''
 
     def _solve(self, sym=True, degenerate=False, decoupled=False, **params):
         return super()._solve(sym, degenerate, decoupled,
@@ -275,9 +278,10 @@ class TestTwoPhaseSolvePrimme(TestTwoPhaseSolve):
         self.skipTest('eigsh path only')
 
     def test_primme_path_and_warm_start(self):
-        '''Phase 3 calls PRIMME and never eigsh with k >= 2; the second
-        solve starts each sector from the kept vectors of the first, plus
-        PRIMME_N_RANDOM random columns.'''
+        '''Phase 3 calls PRIMME and never eigsh with k >= 2, each call with
+        exactly k starting columns; the second solve starts each sector from
+        the kept vectors of the first (up to the admixture) and k - kept
+        random columns.'''
         ref, dm_ref = self._solve(sym=False)
         calls, eigsh_k = [], []
 
@@ -306,10 +310,11 @@ class TestTwoPhaseSolvePrimme(TestTwoPhaseSolve):
                     self._assert_matches_full(ed, ed.calc_density_matrix(), ref, dm_ref)
                 first = {}
                 for a, k, X0 in calls:
+                    self.assertEqual(X0.shape[1], k)
                     first.setdefault(a, X0)
                 for a, V in prev.items():
                     X0 = first[a]
-                    self.assertEqual(X0.shape[1], V.shape[1] + simple_ed.PRIMME_N_RANDOM)
+                    self.assertGreater(X0.shape[1], V.shape[1])
                     # V lies in span(X0) up to the admixture
                     resid = np.linalg.norm(V - X0 @ (X0.conj().T @ V), axis=0)
                     self.assertLess(resid.max(), 2 * simple_ed.PRIMME_WARM_ADMIXTURE)
@@ -337,30 +342,58 @@ class TestTwoPhaseSolvePrimme(TestTwoPhaseSolve):
                 self.assertGreater(len(failed), 2)
                 self._assert_matches_full(ed, dm, ref, dm_ref)
 
-    def test_primme_missing_runs_eigsh(self):
-        '''Without primme, eigensolver='primme' warns and runs eigsh.'''
-        ref, dm_ref = self._solve(sym=False)
+    def test_primme_error_warned_once_per_sector(self):
+        '''PRIMME raising in every call: over two solves each sector warns
+        once, and runs eigsh both times.'''
+        def primme_raises(A, k, **kw):
+            raise simple_ed.primme.PrimmeError(-3)
+
+        with mock.patch.object(simple_ed.primme, 'eigsh', primme_raises), \
+             self.assertWarnsRegex(UserWarning, 'PRIMME failed') as cm:
+            ed, _ = self._solve(num_eig=6, dense_cutoff=40, tol=0.0)
+            ed.solve_Hemb(T=self.T)
+        failed = [str(w.message) for w in cm.warnings if 'PRIMME failed' in str(w.message)]
+        self.assertGreater(len(failed), 2)
+        self.assertEqual(len(failed), len(ed.primme_failed_sectors))
+
+    def test_primme_k_reaches_half_dim(self):
+        '''A window holding half a sector or more: PRIMME's doubling reaches
+        k >= dim/2, and the sector goes straight to eigh (no eigsh with
+        k >= 2), or matrix-free raises.'''
+        T, params = 50.0, dict(bw_cutoff=1e-300, num_eig=6, dense_cutoff=40)
+        eloc, D, Lambdac, V2E = _random_embedding(self.norb)
+
+        def solve(sym, **kw):
+            ed = SimpleED(self.norb, use_Ntot=sym, use_Sz=sym,
+                          solver_params=dict(params, use_mpi=False, **kw))
+            ed.build_Hemb(D, eloc, Lambdac, V2E)
+            ed.solve_Hemb(T=T)
+            return ed
+
+        ref = solve(False, num_eig=None)
         eigsh_k = []
 
         def eigsh_logged(A, k=6, **kw):
             eigsh_k.append(k)
             return eigsh(A, k=k, **kw)
 
-        with mock.patch.object(simple_ed, 'primme', None), \
-             mock.patch.object(simple_ed, 'eigsh', eigsh_logged), \
-             self.assertWarnsRegex(UserWarning, 'primme is not installed'):
-            ed, dm = self._solve(num_eig=6, dense_cutoff=40, tol=0.0)
-        self.assertGreater(max(eigsh_k), 1)
-        self._assert_matches_full(ed, dm, ref, dm_ref)
+        with mock.patch.object(simple_ed, 'eigsh', eigsh_logged):
+            ed = solve(True, eigensolver="primme", primme_tol=1e-12)
+        self.assertEqual(set(eigsh_k), {1})
+        self.assertTrue(any(x[6] == x[1] and x[1] >= 40 for x in ed._prof_sec))
+        self.assertAlmostEqual(ed.Zpart, ref.Zpart, delta=1e-10 * ref.Zpart)
+        self.assertEqual(ed.Tstates, ref.Tstates)
+        with self.assertRaisesRegex(ValueError, 'matrix_free'):
+            solve(True, eigensolver='primme', matrix_free=True)
 
     def test_primme_warm_start_orthogonal_to_ground_state(self):
         '''As test_warm_start_orthogonal_to_ground_state, for PRIMME's warm
         start: with a conserved bath occupation n_b, set each sector's last
         kept vectors to random ones in the n_b subspace without the sector's
         lowest state, which then span (nearly) an invariant subspace. Without
-        the random admixture to each vector PRIMME returns them, converged at
-        once, in place of lower states (Tstates 72-74 of 80); with it, the
-        states of the full diagonalisation.'''
+        the random admixture to each vector PRIMME misses lower states of the
+        other subspace (measured: Tstates 74-75 of 80); with it, the kept
+        states must be those of the full diagonalisation.'''
         ref, dm_ref = self._solve(sym=False, decoupled=True)
         for matrix_free in (False, True):
             with self.subTest(matrix_free=matrix_free):
@@ -388,6 +421,59 @@ class TestTwoPhaseSolvePrimme(TestTwoPhaseSolve):
                 self.assertGreater(n_set, 2)
                 ed.solve_Hemb(T=self.T)
                 self._assert_matches_full(ed, ed.calc_density_matrix(), ref, dm_ref)
+
+    def test_primme_ground_state_energy_near_zero(self):
+        '''PRIMME's stop test is absolute (aNorm = 1): with every sector
+        matrix shifted by the constant c that puts E_gs at 1e-3, both solves
+        (random start, then warm) finish in seconds and keep the states of
+        the full diagonalisation, at energies shifted by c. A test relative
+        to |E_gs| (aNorm = |E_gs|) would ask for a residual of 1e-15 eV,
+        below round-off.'''
+        ref, dm_ref = self._solve(sym=False)
+        c = 1e-3 - ref.gs_ene
+        eloc, D, Lambdac, V2E = _random_embedding(self.norb)
+        ed = SimpleED(self.norb, use_Ntot=True, use_Sz=True,
+                      solver_params=dict(use_mpi=False, bw_cutoff=self.bw_cutoff, num_eig=6,
+                                         dense_cutoff=40, tol=0.0, eigensolver='primme',
+                                         primme_tol=1e-12))
+        ed.build_Hemb(D, eloc, Lambdac, V2E)
+        ed.Ham_list = [(H + c * identity(H.shape[0], dtype=H.dtype, format='csr')).tocsr()
+                       for H in ed.Ham_list]
+        for solve in range(2):
+            t0 = time.perf_counter()
+            ed.solve_Hemb(T=self.T)
+            self.assertLess(time.perf_counter() - t0, 30.0)
+            self.assertAlmostEqual(ed.gs_ene, 1e-3, delta=1e-10)
+            self.assertEqual(ed.Tstates, ref.Tstates)
+            self.assertAlmostEqual(ed.Zpart, ref.Zpart, delta=1e-10)
+            np.testing.assert_allclose(np.sort(np.concatenate(ed.evals_list)) - c,
+                                       ref.evals_list[0], atol=1e-10)
+            np.testing.assert_allclose(ed.calc_density_matrix(), dm_ref, atol=1e-10)
+
+
+class TestPrimmeMissing(unittest.TestCase):
+    '''eigensolver='primme' without the primme package: runs in every
+    environment (primme is patched out).'''
+
+    T, bw_cutoff, norb = TestTwoPhaseSolve.T, TestTwoPhaseSolve.bw_cutoff, TestTwoPhaseSolve.norb
+    _solve = TestTwoPhaseSolve._solve
+    _assert_matches_full = TestTwoPhaseSolve._assert_matches_full
+
+    def test_primme_missing_runs_eigsh(self):
+        '''Without primme, eigensolver='primme' warns and runs eigsh.'''
+        ref, dm_ref = self._solve(sym=False)
+        eigsh_k = []
+
+        def eigsh_logged(A, k=6, **kw):
+            eigsh_k.append(k)
+            return eigsh(A, k=k, **kw)
+
+        with mock.patch.object(simple_ed, 'primme', None), \
+             mock.patch.object(simple_ed, 'eigsh', eigsh_logged), \
+             self.assertWarnsRegex(UserWarning, 'primme is not installed'):
+            ed, dm = self._solve(num_eig=6, dense_cutoff=40, tol=0.0, eigensolver='primme')
+        self.assertGreater(max(eigsh_k), 1)
+        self._assert_matches_full(ed, dm, ref, dm_ref)
 
 
 class TestEmbeddingDiagonal(unittest.TestCase):

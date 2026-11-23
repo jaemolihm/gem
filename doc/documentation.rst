@@ -316,6 +316,16 @@ are:
      - ``1e-8``
      - Smallest Boltzmann weight kept in the partition function at
        :math:`T > 0`.
+   * - ``eigensolver``
+     - ``'arpack'``
+     - ``'arpack'`` or ``'primme'``: the solver of the sectors that go to
+       ``eigsh`` at :math:`T > 0` (phase 3 only). ``'primme'`` needs the
+       optional ``primme`` package; without it ``'arpack'`` runs, with a
+       warning. A sector where PRIMME fails runs ``'arpack'``.
+   * - ``primme_tol``
+     - ``1e-10``
+     - PRIMME convergence: absolute residual :math:`\|H v - E v\|` per
+       eigenpair, in the energy units of :math:`H` (eV).
    * - ``spin_pen``
      - ``0``
      - Coefficient of a :math:`\hat{S}^2` penalty added to the embedding
