@@ -8,13 +8,17 @@ import os
 import time
 import warnings
 from scipy.sparse import csc_matrix, csr_matrix
-from scipy.sparse.linalg import eigsh, ArpackNoConvergence
+from scipy.sparse.linalg import eigsh, ArpackNoConvergence, LinearOperator
 from scipy.linalg import eigh
 import numpy as np
 from numba import jit
 import h5py
 
 from math import factorial, comb
+try:
+    import primme   # optional: solver_params['eigensolver'] = 'primme'
+except ImportError:
+    primme = None
 from itertools import combinations
 
 from .gem_solver import gemSolver
@@ -50,11 +54,23 @@ from ..mpi import MPI, MPI_SUM as _MPI_SUM, resolve_comm
 # mf_lookup_max_norb : In matrix-free mode, build a direct Fock-state lookup
 #            table of 2^norb entries when norb is at most this (default 22),
 #            otherwise fall back to a binary search per applied term.
+# eigensolver : 'arpack' (default) or 'primme': the solver of the T>0 eigsh
+#            sectors in phase 3 (see solve_Hemb). 'primme' needs the primme
+#            package; without it the ARPACK path runs, with a warning.
+# primme_tol : PRIMME convergence, ||H v - E v|| <= primme_tol |E_gs| per
+#            pair (default 1e-10).
 
 # Smallest gap E_{k+1} - E_k (energy units of H, eV) that separates multiplets at
 # the phase-3 starting k; absolute since E_gs moves with mu and the energy
 # reference while the multiplet splittings do not.
 GAP_START_MIN = 1e-2
+
+# PRIMME phase 3: Jacobi preconditioner x -> x / max(diag(H) - E_gs, PRIMME_PRECOND_MIN)
+# (eV; keeps the ground-state rows finite); warm start = each last kept vector
+# + PRIMME_WARM_ADMIXTURE r (r random, unit norm), plus PRIMME_N_RANDOM random columns
+PRIMME_PRECOND_MIN = 0.1
+PRIMME_WARM_ADMIXTURE = 0.01
+PRIMME_N_RANDOM = 4
 
 class SimpleED(gemSolver):
     '''
@@ -199,8 +215,15 @@ class SimpleED(gemSolver):
         self.prev_gs_list   = [None] * self.nloc
         self.prev_nkept_list = [0] * self.nloc  # states kept by the last solve, seeds k
         self.prev_evals_list = [None] * self.nloc  # eigenvalues of the sector's last T > 0 eigsh/eigh (branch 3d); sets the next starting k at a gap
+        self.prev_kept_vecs_list = [None] * self.nloc  # kept vectors of the last solve, PRIMME's warm start (eigensolver='primme' only)
         self._rng           = np.random.default_rng(self.mpi_rank)  # admixture of the phase-1 v0
         self.tb_terms       = None  # cached two-body term list, matrix-free only
+
+        self.eigensolver = self.solver_params.get('eigensolver', 'arpack')
+        if self.eigensolver not in ('arpack', 'primme'):
+            raise ValueError(f"eigensolver must be 'arpack' or 'primme', not {self.eigensolver!r}")
+        if self.eigensolver == 'primme' and primme is None and self.mpi_rank == 0:
+            warnings.warn("eigensolver='primme' but primme is not installed: phase 3 runs ARPACK (eigsh).")
 
         lookup_max = self.solver_params.get('mf_lookup_max_norb', 22)
 
@@ -435,6 +458,13 @@ class SimpleED(gemSolver):
            ``Q^H H Q = U diag(E) U^H``, vectors ``Q U`` (``eigsh``'s vectors
            of a degenerate cluster are not orthogonal).
 
+           With ``solver_params['eigensolver'] = 'primme'`` (and primme
+           installed), these ``T > 0`` sectors go to PRIMME instead
+           (``_phase3_primme``): ``k = k_0`` doubled with the same stop test,
+           started from the sector's kept vectors of the last solve; a sector
+           where PRIMME fails, or ``k`` reaches ``dim/2``, runs the ``eigsh``
+           path above.
+
         :param num_eig: int, optional. Read from solver_params when not given.
             If it is None there too, only the ground state is computed at T=0
             while at T>0 the needed sectors are diagonalised fully. At T=0 it
@@ -481,6 +511,8 @@ class SimpleED(gemSolver):
         else:
             window, margin = 1e-4, 1e-4
         dense_p1 = min(dense_cutoff, 100)
+        use_primme = self.eigensolver == 'primme' and primme is not None
+        primme_tol = self.solver_params.get('primme_tol', 1e-10)
 
         if full_diag and self.matrix_free:
             for s, hsize_s in enumerate(self.hsize_list):
@@ -553,6 +585,12 @@ class SimpleED(gemSolver):
                 k = k_eig
                 vals, vecs = eigsh(Ham_s, k=k, which=which, tol=tol,
                                    v0=self.prev_gs_list[s])
+            elif use_primme and (primme_out := self._phase3_primme(
+                    s, Ham_s, max(2, self.prev_nkept_list[s] + 1), E_gs_p1, window,
+                    primme_tol)) is not None:
+                # 3d'. T > 0, PRIMME: k doubled from kept + 1 until the highest state is outside the window
+                vals, vecs, k = primme_out
+                self.prev_evals_list[s] = np.sort(vals)
             else:
                 # 3d. T > 0: double k until the highest state found is outside the window
                 k = max(2, self.prev_nkept_list[s] + 1)  # k = 1 would repeat phase 1
@@ -662,6 +700,9 @@ class SimpleED(gemSolver):
             self.prev_nkept_list[s] = n_s
             self.evals_list[s] = self.evals_list[s][:n_s]
             self.evecs_list[s] = self.evecs_list[s][:, :n_s]
+            if use_primme:
+                # PRIMME's next warm start; a copy, so that the dropped columns are freed
+                self.evecs_list[s] = self.prev_kept_vecs_list[s] = self.evecs_list[s].copy()
 
         # flattening the bw_list over all ranks, now not ordered
         self.bw_list = [bw for chunk in self.comm.allgather(
@@ -720,6 +761,70 @@ class SimpleED(gemSolver):
             self.evecs = self.evecs_list[0]
 
         return self.gs_wf, self.gs_ene
+
+    def _phase3_primme(self, s, Ham_s, k, E_gs, window, tol):
+        '''Phase 3 of local sector ``s`` at ``T > 0`` with PRIMME: the lowest
+        ``k`` eigenpairs, ``k`` doubled until ``E_k - E_gs >= window``.
+
+        Called by ``solve_Hemb`` for every needed sector of the ``eigsh`` branch
+        (dimension >= ``dense_cutoff``) when ``eigensolver='primme'``. On the
+        clustered spectra of a cold solve ARPACK needs a ``k`` at a gap and a
+        large ``ncv``; PRIMME's JDQMR (``PRIMME_DEFAULT_MIN_TIME``, block size
+        1) with the Jacobi preconditioner ``(diag(H) - E_gs)^-1`` and a warm
+        start from the last solve's kept vectors converges ``k = kept + 1``
+        states at a lower cost per matvec. A pair is converged when
+        ``||H v - E v|| <= tol |E_gs|`` (``aNorm = |E_gs|``); PRIMME returns
+        orthonormal vectors, so no Rayleigh-Ritz step follows.
+
+        PRIMME accepts a starting vector that is already converged even when
+        lower states exist: kept vectors that span an invariant subspace (a
+        quantum number conserved beyond N, Sz) would be returned in place of
+        lower states of another subspace, and the stop test, which assumes the
+        lowest ``k``, would miss those. The random admixture to each kept
+        vector (``PRIMME_WARM_ADMIXTURE``, as in phase 1) makes no starting
+        vector converged, so PRIMME converges the pairs from the lowest Ritz
+        value up, as from a random start.
+
+        :return: ``(vals, vecs, k)``, or None when PRIMME raises or ``k``
+            reaches ``dim/2``; the caller then runs the ``eigsh`` branch.
+        '''
+        n = self.hsize_list[s]
+        complex_H = np.issubdtype(Ham_s.dtype, np.complexfloating)
+
+        def random_columns(m):
+            X = self._rng.standard_normal((n, m))
+            return X + 1j * self._rng.standard_normal((n, m)) if complex_H else X
+
+        # 1. Jacobi preconditioner x -> x / max(diag(H) - E_gs, PRIMME_PRECOND_MIN)
+        dinv = 1.0 / np.maximum(Ham_s.diagonal().real - E_gs, PRIMME_PRECOND_MIN)
+        precond = LinearOperator((n, n), dtype=Ham_s.dtype,
+                                 matvec=lambda x: dinv * np.ravel(x),
+                                 matmat=lambda X: dinv[:, None] * X)
+        # 2. start: v_i + PRIMME_WARM_ADMIXTURE r_i/|r_i| for the last kept v_i, and
+        #    PRIMME_N_RANDOM random columns; else k random columns
+        X_prev = self.prev_kept_vecs_list[s]
+        if X_prev is not None and X_prev.shape[1] > 0:
+            R = random_columns(X_prev.shape[1])
+            X_warm = (X_prev if complex_H else X_prev.real) \
+                + PRIMME_WARM_ADMIXTURE * R / np.linalg.norm(R, axis=0)
+            X0 = np.linalg.qr(np.hstack([X_warm, random_columns(PRIMME_N_RANDOM)]))[0]
+        else:
+            X0 = random_columns(k)
+        while k < n // 2:
+            try:
+                vals, vecs = primme.eigsh(Ham_s, k, which='SA', tol=tol, aNorm=abs(E_gs),
+                                          v0=X0, OPinv=precond, maxBlockSize=1,
+                                          method='PRIMME_DEFAULT_MIN_TIME')
+            except primme.PrimmeError as err:
+                warnings.warn(f"{self._tag()}sector {self.my_sectors[s]}: PRIMME failed at k={k} "
+                              f"({err}), using eigsh.")
+                return None
+            if vals.max() - E_gs >= window:
+                return vals, vecs, k
+            # 3. k -> 2k from the converged vectors (the lowest k, accepted as they are) + k random columns
+            X0 = np.hstack([vecs, random_columns(k)])
+            k *= 2
+        return None
 
     @staticmethod
     def _weighted_trace(op, U, bw):
