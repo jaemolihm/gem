@@ -1241,7 +1241,7 @@ def table_es(nstate, nparticle, spinz, dtype=np.int64):
 # the fermionic signs. find_count is re-exported from there for backward
 # compatibility.
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def build_cid_cj_csc(i, j, basis, bit_max, norb, debug=False):
     row_ind, col_ind, data = [], [], []
     index = np.empty(0, dtype=np.int64)
@@ -1255,7 +1255,7 @@ def build_cid_cj_csc(i, j, basis, bit_max, norb, debug=False):
         row_ind.append(id_bsl); col_ind.append(bsrid); data.append(sign)
     return row_ind, col_ind, data
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def build_two_body_ijkl_csc_2(i, j, k, l, basis, bit_max, norb, debug=False):
     row_ind, col_ind, data = [], [], []
     index = np.empty(0, dtype=np.int64)
