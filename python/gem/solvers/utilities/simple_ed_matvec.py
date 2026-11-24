@@ -275,7 +275,7 @@ def build_dense(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
             Hd[r, c] += tb_v[t] * sign
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def accum_diagonal(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
                    basis, bit_max, norb, diag):
     '''``diag[c] += <c|H|c>``: the terms that map the Fock state ``c`` to itself.'''
