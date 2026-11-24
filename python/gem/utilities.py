@@ -195,7 +195,7 @@ def dF(A, H, function, d_function):
 
 #Also on delta fit
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def calc_Fermi(x):
     """
     calculate the fermi function for a vector x. Sometimes smearing the fermi function can
@@ -214,7 +214,7 @@ def calc_Fermi(x):
             f.append(0)
     return np.array(f)
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def calc_nf(H,T):
     """
     Apply the Fermi function to a Hamiltonian H at temperature T.

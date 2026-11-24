@@ -50,7 +50,7 @@ def build_index_table(basis, norb, max_norb=22):
     return index
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def lookup(bsl, basis, index):
     '''Position of the Fock state ``bsl`` in the sorted ``basis``, -1 if absent.'''
     if index.size > 0:
@@ -66,7 +66,7 @@ def lookup(bsl, basis, index):
 
 # -- shared bit algebra --------------------------------------------------
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def find_count(i, j, bsr, norb, bsltmp):
     '''Fermionic sign count for c_i^dag c_j.'''
     bit_tmp = (((1 << j) - 1) & (bsr >> (norb - j)))
@@ -81,7 +81,7 @@ def find_count(i, j, bsr, norb, bsltmp):
     return count
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def cid_cj_target(i, j, bsr, bit_max, norb):
     '''Apply ``c^dag_i c_j`` to the Fock state ``bsr``.
 
@@ -99,7 +99,7 @@ def cid_cj_target(i, j, bsr, bit_max, norb):
     return np.int64(bsl), 1
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def two_body_target(i, j, k, l, bsr, bit_max, norb):
     '''Apply ``c^dag_i c^dag_k c_l c_j`` to the Fock state ``bsr``.
 
@@ -149,7 +149,7 @@ def two_body_target(i, j, k, l, bsr, bit_max, norb):
     return np.int64(bsl), 1
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def docc_target(i, bsr, bit_max, norb):
     '''Apply the double-occupancy operator on orbitals ``(i, i+1)`` to ``bsr``.'''
     tmp_bit1 = bit_max >> (i + 1)
@@ -222,7 +222,7 @@ def empty_two_body_terms(dtype=np.complex128):
 
 # -- kernels -------------------------------------------------------------
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def apply_terms(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
                 basis, index, bit_max, norb, x, out):
     '''``out += H @ x`` for the one-body + two-body term lists.'''
@@ -250,7 +250,7 @@ def apply_terms(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
             out[r] += tb_v[t] * sign * xc
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def build_dense(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
                 basis, index, bit_max, norb, Hd):
     '''``Hd += H`` as a dense array, for the small-sector eigh branch.'''
@@ -275,7 +275,7 @@ def build_dense(ob_i, ob_j, ob_v, tb_i, tb_j, tb_k, tb_l, tb_v,
             Hd[r, c] += tb_v[t] * sign
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def accum_denmat(basis, index, bit_max, norb, nmax, U, bw, dm):
     '''``dm[i,j] += sum_n bw[n] <n| c^dag_i c_j |n>`` for ``i, j < nmax``.
 
@@ -301,7 +301,7 @@ def accum_denmat(basis, index, bit_max, norb, nmax, U, bw, dm):
                 dm[i, j] += sign * acc
 
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def accum_docc(basis, index, bit_max, norb, i, U, bw):
     '''``sum_n bw[n] <n| n_i n_{i+1} |n>``.'''
     nst   = bw.size
